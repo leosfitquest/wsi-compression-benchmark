@@ -21,3 +21,8 @@ results_*.csv
 
 # Private Notizen & Excel-Tabellen
 Todo/
+
+# Instituts-Notebook & Temp-Dateien
+example_usage/example_usage.ipynb
+**/__MACOSX/
+example_usage/djfsjfhc.md
