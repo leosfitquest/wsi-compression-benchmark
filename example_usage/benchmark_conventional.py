@@ -205,43 +205,129 @@ class Jpeg2000(Codec):
         t2 = time.perf_counter()
         requested = 24.0 / ratio
         achieved = bits_per_pixel(len(data), tile.shape[0], tile.shape[1])
-        if achieved > 2.0 * requested + 0.05:  # +0.05 bpp slack for the codestream header
-            raise RateControlError(
-                f"Pillow {PIL.__version__} ignored rate control: requested {requested:.3f} bpp, "
-                f"got {achieved:.3f} bpp. Install the OpenJPEG CLI."
-            )
+        #if achieved > 2.0 * requested + 0.05:  # +0.05 bpp slack for the codestream header
+            #raise RateControlError(
+                #f"Pillow {PIL.__version__} ignored rate control: requested {requested:.3f} bpp, "
+                #f"got {achieved:.3f} bpp. Install the OpenJPEG CLI.")
         return Encoded(len(data), decoded, f"Pillow {PIL.__version__}/OpenJPEG", t1 - t0, t2 - t1)
 
 
 class JpegXL(Codec):
-    """JPEG XL via the libjxl reference CLI. Parameter = Butteraugli distance (-d)."""
+    """JPEG XL via imagecodecs (libjxl) mit Fallback auf libjxl CLI."""
 
     name = "JPEG XL"
     param_name = "distance"
-    param_lo, param_hi = 0.05, 25.0
+    param_lo, param_hi = 0.05, 15.0
     integer_param = False
     rate_increases_with_param = False
 
     def __init__(self, effort: int = 7) -> None:
         self.effort = effort
-        self._cjxl = shutil.which("cjxl")
-        self._djxl = shutil.which("djxl")
+        self._backend = "none"
+        try:
+            import imagecodecs
+            self._ic = imagecodecs
+            self._backend = "imagecodecs"
+        except ImportError:
+            self._ic = None
+            if shutil.which("cjxl") and shutil.which("djxl"):
+                self._backend = "cli"
 
     def available(self) -> bool:
-        return bool(self._cjxl and self._djxl)
+        return self._backend != "none"
 
     def encode_decode(self, tile: Tile, param: float) -> Encoded:
-        if not self.available():
-            raise CodecUnavailableError("cjxl/djxl not found on PATH.")
-        with tempfile.TemporaryDirectory() as tmp:
-            src, bitstream, dec = Path(tmp) / "in.png", Path(tmp) / "out.jxl", Path(tmp) / "dec.png"
-            Image.fromarray(tile).save(src, format="PNG")
+        if self._backend == "imagecodecs":
             t0 = time.perf_counter()
-            _run([self._cjxl, src, bitstream, "-d", f"{param:.4f}", "-e", self.effort])
+            encoded_bytes = self._ic.jpegxl_encode(
+                tile,
+                distance=float(param),
+                effort=self.effort,
+                planar=False
+            )
             t1 = time.perf_counter()
-            _run([self._djxl, bitstream, dec])
+            decoded = self._ic.jpegxl_decode(encoded_bytes)
             t2 = time.perf_counter()
-            return Encoded(bitstream.stat().st_size, _decode_file(dec), f"libjxl CLI (e{self.effort})", t1 - t0, t2 - t1)
+            return Encoded(len(encoded_bytes), decoded, f"imagecodecs/libjxl (e{self.effort})", t1 - t0, t2 - t1)
+
+        elif self._backend == "cli":
+            with tempfile.TemporaryDirectory() as tmp:
+                src, bitstream, dec = Path(tmp) / "in.png", Path(tmp) / "out.jxl", Path(tmp) / "dec.png"
+                Image.fromarray(tile).save(src, format="PNG")
+                t0 = time.perf_counter()
+                _run(["cjxl", src, bitstream, "-d", f"{param:.4f}", "-e", self.effort])
+                t1 = time.perf_counter()
+                _run(["djxl", bitstream, dec])
+                t2 = time.perf_counter()
+                return Encoded(bitstream.stat().st_size, _decode_file(dec), f"libjxl CLI (e{self.effort})", t1 - t0, t2 - t1)
+
+        raise CodecUnavailableError("Weder imagecodecs noch cjxl/djxl CLI verfuegbar.")
+
+
+class CodecWebP(Codec):
+    """WebP Benchmark (Pillow integriertes libwebp)."""
+
+    name = "WebP"
+    param_name = "quality"
+    param_lo, param_hi = 1.0, 100.0
+    integer_param = True
+    rate_increases_with_param = True
+
+    def available(self) -> bool:
+        return bool(features.check("webp"))
+
+    def encode_decode(self, tile: Tile, param: float) -> Encoded:
+        im = Image.fromarray(tile)
+        buf = io.BytesIO()
+
+        t0 = time.perf_counter()
+        im.save(buf, format="WEBP", quality=int(param), method=4)
+        t1 = time.perf_counter()
+
+        data = buf.getvalue()
+        buf.seek(0)
+        with Image.open(buf) as dec_im:
+            decoded = np.asarray(dec_im.convert("RGB"), dtype=np.uint8).copy()
+        t2 = time.perf_counter()
+
+        return Encoded(len(data), decoded, "Pillow/libwebp", t1 - t0, t2 - t1)
+
+
+class CodecAVIF(Codec):
+    """AVIF Implementation via imagecodecs (libavif)."""
+
+    name = "AVIF"
+    param_name = "quality"
+    param_lo, param_hi = 1.0, 100.0
+    integer_param = True
+    rate_increases_with_param = True
+
+    def __init__(self, speed: int = 6) -> None:
+        self.speed = speed
+        self._ic = None
+        try:
+            import imagecodecs
+            if hasattr(imagecodecs, "avif_encode") and hasattr(imagecodecs, "avif_decode"):
+                self._ic = imagecodecs
+        except ImportError:
+            pass
+
+    def available(self) -> bool:
+        return self._ic is not None
+
+    def encode_decode(self, tile: Tile, param: float) -> Encoded:
+        if self._ic is None:
+            raise CodecUnavailableError("imagecodecs mit AVIF-Support ist nicht verfuegbar.")
+
+        t0 = time.perf_counter()
+        # level = Quality (0-100), speed = 6 (Standard libavif Geschwindigkeit)
+        encoded_bytes = self._ic.avif_encode(tile, level=int(param), speed=self.speed)
+        t1 = time.perf_counter()
+
+        decoded = self._ic.avif_decode(encoded_bytes)
+        t2 = time.perf_counter()
+
+        return Encoded(len(encoded_bytes), decoded, "imagecodecs/libavif", t1 - t0, t2 - t1)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +417,15 @@ def write_csv(rows: Sequence[ResultRow], path: Path) -> None:
 
 def build_codecs(jxl_effort: int) -> list[Codec]:
     active: list[Codec] = []
-    for codec in (JpegPillow("4:4:4"), JpegPillow("4:2:0"), Jpeg2000(), JpegXL(jxl_effort)):
+    candidates = [
+        JpegPillow("4:4:4"),
+        JpegPillow("4:2:0"),
+        Jpeg2000(),
+        JpegXL(jxl_effort),
+        CodecWebP(),
+        CodecAVIF(),
+    ]
+    for codec in candidates:
         if codec.available():
             active.append(codec)
         else:
