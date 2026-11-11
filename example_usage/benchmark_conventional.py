@@ -5,7 +5,9 @@ Rate-distortion benchmark of conventional codecs on RGB tiles.
 
     JPEG       Pillow (bundled libjpeg-turbo), chroma 4:4:4 and 4:2:0
     JPEG 2000  OpenJPEG CLI (opj_compress / opj_decompress); Pillow+OpenJPEG fallback
-    JPEG XL    libjxl CLI (cjxl / djxl) only. Skipped if missing; never substituted.
+    JPEG XL    imagecodecs (libjxl) with fallback to libjxl CLI (cjxl / djxl)
+    WebP       Pillow (bundled libwebp)
+    AVIF       imagecodecs (libavif)
 
 For every tile, codec and target bit rate, the codec parameter (JPEG quality,
 J2K compression ratio, JXL distance) is bisected until the compressed file lands
@@ -217,7 +219,7 @@ class JpegXL(Codec):
 
     name = "JPEG XL"
     param_name = "distance"
-    param_lo, param_hi = 0.05, 15.0
+    param_lo, param_hi = 0.05, 25.0
     integer_param = False
     rate_increases_with_param = False
 
