@@ -1,0 +1,9 @@
+Cohort,Codec / Model,BD-Rate PSNR [%],BD-PSNR [dB],BD-Rate MS-SSIM [%],Min bpp,Max bpp
+IDC RMS (Lossless Ground-Truth),cheng2020-attn,-60.31,5.28,-57.33,0.182,0.9
+IDC RMS (Lossless Ground-Truth),bmshj2018-hyperprior,-55.72,4.74,-54.02,0.196,0.956
+IDC RMS (Lossless Ground-Truth),AVIF,-44.41,3.06,-42.9,0.154,1.496
+IDC RMS (Lossless Ground-Truth),JPEG 2000,-41.25,2.65,-36.06,0.119,1.499
+IDC RMS (Lossless Ground-Truth),JPEG XL,-33.01,2.28,-28.48,0.182,1.505
+IDC RMS (Lossless Ground-Truth),WebP,-18.61,1.24,-21.33,0.287,1.514
+IDC RMS (Lossless Ground-Truth),JPEG 4:2:0,-7.41,0.33,-10.78,0.145,1.497
+IDC RMS (Lossless Ground-Truth),JPEG 4:4:4,0.0,0.0,0.0,0.194,1.499

@@ -1,0 +1,9 @@
+codec_or_model,category,backend,setting,bpp,psnr_db,enc_ms,dec_ms,enc_mpix_s,dec_mpix_s,peak_ram_mb,params_m,kmacs_per_px
+JPEG 4:4:4,conventional,Pillow/libjpeg,target=0.36bpp (quality=6),0.3584,25.16,0.48,0.38,136.82,172.52,0.38,,
+JPEG 4:2:0,conventional,Pillow/libjpeg,target=0.36bpp (quality=8),0.3555,25.9,0.35,0.35,186.22,186.18,0.38,,
+JPEG 2000,conventional,Pillow 12.3.0/OpenJPEG,target=0.36bpp (ratio=65.9478),0.3522,28.26,17.03,2.02,3.85,32.51,0.38,,
+JPEG XL,conventional,imagecodecs/libjxl (e7),target=0.36bpp (distance=12.6689),0.3593,27.84,36.3,4.7,1.81,13.96,0.19,,
+WebP,conventional,Pillow/libwebp,target=0.36bpp (quality=3),0.3547,27.54,10.33,1.55,6.34,42.34,0.38,,
+AVIF,conventional,imagecodecs/libavif,target=0.36bpp (quality=28),0.36,28.93,51.01,1.02,1.28,64.28,0.19,,
+bmshj2018-hyperprior,neural,CompressAI/CPU (rANS),quality=3,0.3685,30.24,56.32,64.84,1.164,1.011,2.98,5.076,188.23
+cheng2020-attn,neural,CompressAI/CPU (rANS),quality=3,0.3477,30.53,491.08,1155.17,0.133,0.057,2.79,13.183,460.48

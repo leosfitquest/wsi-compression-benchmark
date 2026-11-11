@@ -1,0 +1,9 @@
+Cohort,Codec / Model,BD-Rate PSNR [%],BD-PSNR [dB],BD-Rate MS-SSIM [%],Min bpp,Max bpp
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),cheng2020-attn,-70.94,10.22,-76.61,0.095,0.386
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),bmshj2018-hyperprior,-63.97,8.46,-71.46,0.113,0.466
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),AVIF,-50.83,5.11,-59.58,0.134,1.478
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),JPEG 2000,-45.59,4.48,-47.82,0.12,1.5
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),JPEG XL,-42.31,4.38,-47.74,0.153,1.505
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),WebP,-22.7,2.34,-36.14,0.185,1.53
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),JPEG 4:2:0,-7.42,0.4,-13.33,0.127,1.505
+TCGA-LUAD (Scanner Q=70 Pre-Compressed),JPEG 4:4:4,0.0,0.0,0.0,0.176,1.498
