@@ -1,147 +1,70 @@
-# Whole Slide Image (WSI) Compression Benchmark
+﻿# Whole Slide Image (WSI) Compression Benchmark
 
-An end-to-end Rate-Distortion (R-D) and Computational Complexity benchmarking suite for evaluating **conventional image codecs** (`JPEG 4:4:4`, `JPEG 4:2:0`, `JPEG 2000`, `WebP`, `JPEG XL`, `AVIF`) and **learned neural compression models** (`CompressAI` `bmshj2018-hyperprior`, `cheng2020-attn`) on histopathology Whole Slide Images (H&E).
+A modular Rate-Distortion (R-D) and Computational Complexity benchmarking suite for evaluating **conventional image codecs** (`JPEG`, `JPEG 2000`, `WebP`, `JPEG XL`, `AVIF`) and **learned neural compression models** (`CompressAI`) on histopathology Whole Slide Images (H&E).
 
 ![H&E Visual Showcase](example_usage/he_showcase.png)
 
 ---
 
-## 1. Motivation & Core Objective
+## 1. Objective & Motivation
 
-In digital pathology, a single Whole Slide Image (WSI) scanned at $40\times$ magnification ($\approx 0.25\,\mu\text{m/px}$) easily exceeds $100{,}000 \times 100{,}000$ pixels, resulting in multi-gigabyte raw files. To manage storage, clinical slide scanners routinely apply lossy **JPEG ($Q=70\text{–}80$, $\approx 0.28\text{ bpp}$)** compression directly during image acquisition.
-
-### The Problem: Generation Loss Bias in Public Repositories
-Most large-scale public pathology repositories (such as **TCGA**) store slides that have *already* undergone lossy scanner compression. Using such pre-compressed images as "ground truth" in compression benchmarks introduces severe **Generation Loss Bias**:
-1. High-frequency chromatin and tissue textures have already been quantized away by the scanner's $8 \times 8$ DCT grid.
-2. Re-compressing pre-smoothed tiles artificially inflates PSNR/MS-SSIM scores (reaching $>44\text{ dB}$) and skews neural entropy models toward unrealistically low bitrates.
-
-### Project Goal
-The goal of this project is to establish a **reproducible, strictly unbiased evaluation pipeline** that:
-1. Evaluates codecs on **verified lossless Level-0 WSI ground truth** (NCI Imaging Data Commons RMS cohort, stored with DICOM Transfer Syntax `1.2.840.10008.1.2.4.90` / JPEG 2000 Lossless and `LossyImageCompression = 00`).
-2. Directly quantifies the distortion and bitrate drift between **lossless ground truth (IDC RMS)** and **scanner pre-compressed data (TCGA-LUAD)**.
-3. Measures real-world **computational complexity** (encoding/decoding throughput in $\text{MPix/s}$, memory footprint, model parameters, and $\text{kMACs/px}$) at matched iso-bitrates to assess clinical viability for real-time WSI viewing.
+* **The Problem:** Most public digital pathology repositories (e.g., TCGA) store slides that are already pre-compressed by clinical scanners (`JPEG Q=70â€“80`, $\approx 0.28\text{ bpp}$). Using pre-compressed data as ground truth introduces **Generation Loss Bias** (missing high-frequency chromatin details and artificially inflated PSNR/MS-SSIM scores).
+* **The Solution:** This pipeline establishes an unbiased benchmark using **verified lossless Level-0 WSI ground truth** from the NCI Imaging Data Commons (DICOM Transfer Syntax `.90` / JPEG 2000 Lossless) and compares it against scanner pre-compressed cohorts.
+* ** Evaluation Scope:** Standardized comparison across bitrate (`bpp`), fidelity (`RGB-PSNR`, `MS-SSIM`), BjÃ¸ntegaard-Delta (`BD-Rate`), and hardware complexity (`MPix/s`, `MParams`, `kMACs/px`).
 
 ---
 
-## 2. Benchmark Pipeline & Architecture
+## 2. Pipeline Architecture
 
 ```mermaid
 flowchart LR
-    subgraph Data["1. Data Acquisition & Tile Extraction"]
-        A["NCI IDC Cloud\n(DICOM .90 Lossless)"] -->|download_one_rms.py| B["Level-0 WSI (.dcm)"]
-        B -->|extract_dicom_tiles.py\nTissue Filter| C["Lossless 256x256\nRGB Tiles (.png)"]
-        D["TCGA-LUAD SVS\n(Scanner Q=70)"] --> E["Pre-Compressed\n256x256 Tiles (.png)"]
-    end
-
-    subgraph Bench["2. Compression Engines"]
-        C & E --> F["benchmark_conventional.py\n(Log/Grid Bisection Search)"]
-        C & E --> G["benchmark_compressai.py\n(Pretrained Neural Models)"]
-        C --> H["complexity_tracker.py\n(Single-Pass Timing & PyTorch Hooks)"]
-    end
-
-    subgraph Eval["3. Unified Scoring & Analysis"]
-        F & G -->|uint8 RGB Arrays| I["metrics.py\n(RGB-PSNR & 5-Scale MS-SSIM)"]
-        I --> J["bdrate_summary.py\n(ITU-T VCEG-M33 BD-Rate)"]
-        I --> K["plot_rd_curves*.py &\nmerge_plots.py"]
-        H --> L["plot_complexity.py\n(Throughput & Pareto Front)"]
-    end
+    A["DICOM .90 Lossless\n& TCGA SVS"] -->|extract_dicom_tiles.py| B["256x256 RGB\nTiles (.png)"]
+    B --> C["benchmark_conventional.py\n(JPEG, J2K, WebP, JXL, AVIF)"]
+    B --> D["benchmark_compressai.py\n(Hyperprior, Cheng2020)"]
+    B --> E["complexity_tracker.py\n(MPix/s, RAM, kMACs/px)"]
+    C & D --> F["metrics.py & bdrate_summary.py\n(PSNR, MS-SSIM, BD-Rate)"]
+    F & E --> G["plot_rd_curves.py &\nplot_complexity.py"]
 ```
 
 ---
 
-## 3. Repository Structure & Code Modules
+## 3. Code Overview (`example_usage/`)
 
-All benchmark scripts are located in the `example_usage/` directory and share a unified metric and tile-loading core so that conventional and neural codecs are scored under identical conditions:
-
-| Script / Module | Purpose & Technical Description |
+| Script | Description |
 | :--- | :--- |
-| **`download_one_rms.py`** | Queries the NCI Imaging Data Commons (`idc-index`) metadata catalog, filters strictly for lossless brightfield H&E slides (`TransferSyntaxUID = 1.2.840.10008.1.2.4.90`, `LossyImageCompression = 00`), and downloads the verified series via `s5cmd`. |
-| **`extract_dicom_tiles.py`** | Opens Level-0 DICOM WSIs via `OpenSlide`, filters out glass background ($\mu > 220$) and scanner borders ($\mu < 30$), and exports native $256 \times 256$ lossless PNG tiles. |
-| **`tiles.py`** | Provides uniform RGB `uint8` tile loaders (`tiles_from_dir`) as well as deterministic synthetic H&E-like tissue generators (`synthetic_tiles`) for quick pipeline tests. |
-| **`metrics.py`** | Dependency-light (`numpy`-only) implementation of `bits_per_pixel`, pooled `psnr_rgb`, and 5-scale `ms_ssim_rgb` ($11 \times 11$ Gaussian window, $\sigma=1.5$ following Wang et al. / `pytorch_msssim` conventions). |
-| **`benchmark_conventional.py`** | Evaluates 6 conventional codecs (`JPEG 4:4:4`, `JPEG 4:2:0`, `JPEG 2000`, `JPEG XL`, `WebP`, `AVIF`) across target bitrates ($0.12\text{ to }1.50\text{ bpp}$). Uses log-scale and integer-grid bisection search (`match_target_bpp`) to match each tile to the exact target bitrate. |
-| **`benchmark_compressai.py`** | Evaluates pretrained neural compression models (`bmshj2018-hyperprior`, `cheng2020-attn`) across quality levels $q \in \{1..6\}$. Reports both likelihood-estimated rate (`bpp_est`) and actual rANS bitstream rate (`bpp_real`). |
-| **`complexity_tracker.py`** | Measures single-pass encoding/decoding latency ($\text{ms}$) and throughput ($\text{MPix/s}$) decoupled from bisection and memory-profiler overhead. Tracks Python peak memory (`tracemalloc`) and counts neural parameters ($\text{MParams}$) and multiply-accumulate operations ($\text{kMACs/px}$) via PyTorch forward hooks at an iso-bitrate of $\approx 0.36\text{ bpp}$. |
-| **`bdrate_summary.py`** | Computes **Bjøntegaard-Delta Rate (BD-Rate in %)** and **BD-PSNR (dB)** relative to `JPEG 4:4:4` via cubic polynomial integration in the log-rate domain (ITU-T VCEG-M33), including log-domain linearization for MS-SSIM ($-10 \log_{10}(1 - \text{MS-SSIM})$). |
-| **`plot_rd_curves.py`** & **`plot_rd_curves_tcga.py`** | Generate publication-grade Rate-Distortion curves (PSNR and MS-SSIM vs. bitrate) with lower-bound saturation deduplication and a reference line for the clinical scanner baseline ($0.28\text{ bpp}$). |
-| **`merge_plots.py`** | Combines the pre-compressed TCGA and lossless RMS R-D plots vertically into `rd_curves_combined_comparison.png`. |
-| **`plot_complexity.py`** | Visualizes encoding vs. decoding throughput (log-scale bar chart) alongside the quality vs. decoding speed Pareto front (`complexity_comparison.png`). |
-| **`make_he_showcase.py`** | Generates the visual H&E comparison banner (`he_showcase.png`) at $0.25\text{ bpp}$. |
+| **`download_one_rms.py`** | Queries NCI IDC (`idc-index`) and downloads verified lossless H&E DICOM slides (`.90`). |
+| **`extract_dicom_tiles.py`** | Extracts non-overlapping $256 \times 256$ Level-0 tissue tiles via `OpenSlide` (filtering out glass background). |
+| **`tiles.py`** | Loads PNG/TIFF tiles as `uint8` RGB arrays or generates synthetic H&E test tiles. |
+| **`metrics.py`** | Computes `bits_per_pixel`, pooled `psnr_rgb`, and 5-scale `ms_ssim_rgb` (`numpy`-only). |
+| **`benchmark_conventional.py`** | Bisects codec parameters to match target bitrates ($0.12\text{â€“}1.50\text{ bpp}$) across all 6 conventional codecs. |
+| **`benchmark_compressai.py`** | Evaluates pretrained CompressAI models (`bmshj2018-hyperprior`, `cheng2020-attn`) using real rANS entropy coding. |
+| **`complexity_tracker.py`** | Profiles single-pass encoding/decoding throughput ($\text{MPix/s}$), peak RAM, model parameters, and $\text{kMACs/px}$. |
+| **`bdrate_summary.py`** | Calculates ITU-T VCEG-M33 **BD-Rate (%)** and **BD-PSNR (dB)** relative to `JPEG 4:4:4`. |
+| **`plot_rd_curves*.py`** | Plots R-D curves (`plot_rd_curves.py`, `plot_rd_curves_tcga.py`, `merge_plots.py`). |
+| **`plot_complexity.py`** | Generates log-scale throughput bar charts and Pareto front scatter plots. |
 
 ---
 
-## 4. Key Experimental Results
+## 4. Quickstart
 
-### 4.1 Rate-Distortion Performance: Pre-Compressed (TCGA) vs. Lossless Ground Truth (IDC RMS)
-
-![Combined Rate-Distortion Curves](example_usage/rd_curves_combined_comparison.png)
-
-#### Bjøntegaard-Delta Summary on Lossless Ground Truth (IDC RMS Cohort, Anchor: `JPEG 4:4:4`)
-
-| Codec / Model | Category | BD-Rate PSNR [%] | BD-PSNR [dB] | BD-Rate MS-SSIM [%] | Evaluated Bitrate Range [bpp] |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **`cheng2020-attn`** | Neural (CompressAI) | **-60.31 %** | **+5.28 dB** | **-57.33 %** | 0.182 – 0.900 |
-| **`bmshj2018-hyperprior`** | Neural (CompressAI) | **-55.72 %** | **+4.74 dB** | **-54.02 %** | 0.196 – 0.956 |
-| **`AVIF` (libavif)** | Conventional | **-44.41 %** | **+3.06 dB** | **-42.90 %** | 0.154 – 1.496 |
-| **`JPEG 2000` (OpenJPEG)** | Conventional | **-41.25 %** | **+2.65 dB** | **-36.06 %** | 0.119 – 1.499 |
-| **`JPEG XL` (libjxl)** | Conventional | **-33.01 %** | **+2.28 dB** | **-28.48 %** | 0.182 – 1.505 |
-| **`WebP` (libwebp)** | Conventional | **-18.61 %** | **+1.24 dB** | **-21.33 %** | 0.287 – 1.514 |
-| **`JPEG 4:2:0`** | Conventional | **-7.41 %** | **+0.33 dB** | **-10.78 %** | 0.145 – 1.497 |
-| **`JPEG 4:4:4` (Anchor)** | Conventional | 0.00 % | 0.00 dB | 0.00 % | 0.194 – 1.499 |
-
----
-
-### 4.2 Computational Complexity & Pareto Front (Iso-Bitrate $\approx 0.36\text{ bpp}$)
-
-![Computational Complexity Comparison](example_usage/complexity_comparison.png)
-
-| Codec / Model | Achieved Rate [bpp] | RGB-PSNR [dB] | Enc Time [ms] | Dec Time [ms] | Enc Speed [MPix/s] | Dec Speed [MPix/s] | Params [M] | Complexity [kMAC/px] |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`JPEG 4:2:0`** | 0.355 | 25.90 | 0.3 | 0.3 | 186.22 | 186.18 | – | – |
-| **`JPEG 4:4:4`** | 0.358 | 25.16 | 0.5 | 0.4 | 136.82 | 172.52 | – | – |
-| **`AVIF` (speed=6)** | 0.360 | 28.93 | 51.0 | 1.0 | 1.28 | **64.28** | – | – |
-| **`WebP` (method=4)** | 0.355 | 27.54 | 10.3 | 1.6 | 6.34 | 42.34 | – | – |
-| **`JPEG 2000`** | 0.352 | 28.26 | 17.0 | 2.0 | 3.85 | 32.51 | – | – |
-| **`JPEG XL` (effort=7)** | 0.359 | 27.84 | 36.3 | 4.7 | 1.81 | 13.96 | – | – |
-| **`bmshj2018-hyperprior`** | 0.368 | 30.24 | 56.3 | 64.8 | 1.16 | 1.01 | 5.08 | 188.2 |
-| **`cheng2020-attn`** | 0.348 | **30.53** | 491.1 | 1155.2 | 0.13 | 0.06 | 13.18 | 460.5 |
-
-**Key Takeaways:**
-* **Neural vs. Conventional:** Learned compression (`cheng2020-attn`) achieves the highest reconstruction fidelity ($>60\%$ bitrate savings over JPEG), but its autoregressive context model induces a severe sequential CPU decoding bottleneck ($0.06\text{ MPix/s}$). Non-autoregressive `bmshj2018-hyperprior` decodes $>16\times$ faster while retaining $55.7\%$ bitrate savings.
-* **Best Conventional Trade-Off:** **`AVIF`** occupies the sweet spot on the Pareto front, delivering $+3.77\text{ dB}$ higher PSNR than `JPEG 4:4:4` at $0.36\text{ bpp}$ while maintaining real-time decoding throughput (**$64.28\text{ MPix/s}$**, $\approx 1.0\text{ ms}$ per $256 \times 256$ tile).
-
----
-
-## 5. Reproducibility & Quickstart
-
-### 1. Install Dependencies
 ```bash
+# 1. Install dependencies
 pip install numpy pandas matplotlib Pillow imagecodecs torch torchvision compressai openslide-python idc-index
-```
 
-### 2. Run the Full Benchmark Pipeline
-```bash
+# 2. Run benchmarks on extracted 256x256 tiles
 cd example_usage
-
-# 1. Download a verified lossless DICOM WSI & extract 256x256 tissue tiles
-python download_one_rms.py
-python extract_dicom_tiles.py
-
-# 2. Run conventional and neural R-D benchmarks
 python benchmark_conventional.py --tiles-dir tiles_rms_lossless_256 --out results_rms_conv.csv
 python benchmark_compressai.py --tiles-dir tiles_rms_lossless_256 --out results_rms_ai.csv
 
-# 3. Generate R-D plots, BD-Rate summaries, and Complexity benchmarks
+# 3. Generate plots, complexity metrics, and BD-Rate summary
 python plot_rd_curves.py
-python bdrate_summary.py
 python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 3
 python plot_complexity.py
+python bdrate_summary.py
 ```
 
 ---
 
-## 6. Contact & Bug Reports
+## 5. Contact & Bug Reports
 
-This benchmark is under active development. If you encounter any bugs, edge cases, reproducibility issues, or have suggestions for additional codecs or evaluation metrics, please feel free to:
-* **Open an Issue** directly in this GitHub repository, or
-* **Send me an email:** [leonard.saghyan@rwth-aachen.de](mailto:leonard.saghyan@rwth-aachen.de) *(or reach out via GitHub)* — I will gladly look into it and get back to you!
+If you encounter any bugs, reproducibility issues, or have questions regarding the benchmark setup, please **open an issue** in this repository or **send me an email** at [leonard.saghyan@rwth-aachen.de](mailto:leonard.saghyan@rwth-aachen.de) â€” I will gladly look into it!

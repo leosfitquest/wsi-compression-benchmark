@@ -1,4 +1,4 @@
-"""
+﻿"""
 make_he_showcase.py
 -------------------
 Creates a visual H&E tissue comparison banner (he_showcase.png) for the README:
@@ -37,7 +37,7 @@ for ax, (title, img, subtitle) in zip(axes, panels):
     ax.text(0.5, 1.02, subtitle, transform=ax.transAxes, ha="center", fontsize=8.5, color="#333333")
     ax.axis("off")
 
-plt.suptitle("H&E Whole Slide Image Tile (256x256 px, Level-0) — Visual Comparison @ ~0.25 bpp", fontsize=12, fontweight="bold", y=0.99)
+plt.suptitle("H&E Whole Slide Image Tile (256x256 px, Level-0) â€” Visual Comparison @ ~0.25 bpp", fontsize=12, fontweight="bold", y=1.08)
 plt.tight_layout()
 
 out_path = Path("he_showcase.png")
