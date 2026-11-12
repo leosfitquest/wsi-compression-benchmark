@@ -67,4 +67,4 @@ python bdrate_summary.py
 
 ## 5. Contact & Bug Reports
 
-If you encounter any bugs, reproducibility issues, or have questions regarding the benchmark setup, please **open an issue** in this repository or **send me an email** at [leonard.saghyan@rwth-aachen.de](mailto:leonard.saghyan@rwth-aachen.de) â€” I will gladly look into it!
+If you encounter any bugs, reproducibility issues, or have questions regarding the benchmark setup, please **open an issue** in this repository or **send me an email** at [leonard.saghyan@rwth-aachen.de](mailto:leonard.saghyan@rwth-aachen.de) ” I will gladly look into it!
