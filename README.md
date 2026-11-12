@@ -8,7 +8,7 @@ A modular Rate-Distortion (R-D) and Computational Complexity benchmarking suite 
 
 ## 1. Objective & Motivation
 
-* **The Problem:** Most public digital pathology repositories (e.g., TCGA) store slides that are already pre-compressed by clinical scanners (`JPEG Q=70â€“80`, $\approx 0.28\text{ bpp}$). Using pre-compressed data as ground truth introduces **Generation Loss Bias** (missing high-frequency chromatin details and artificially inflated PSNR/MS-SSIM scores).
+* **The Problem:** Most public digital pathology repositories (e.g., TCGA) store slides that are already pre-compressed by clinical scanners (`JPEG Q=70t“80`, $\approx 0.28\text{ bpp}$). Using pre-compressed data as ground truth introduces **Generation Loss Bias** (missing high-frequency chromatin details and artificially inflated PSNR/MS-SSIM scores).
 * **The Solution:** This pipeline establishes an unbiased benchmark using **verified lossless Level-0 WSI ground truth** from the NCI Imaging Data Commons (DICOM Transfer Syntax `.90` / JPEG 2000 Lossless) and compares it against scanner pre-compressed cohorts.
 * ** Evaluation Scope:** Standardized comparison across bitrate (`bpp`), fidelity (`RGB-PSNR`, `MS-SSIM`), BjÃ¸ntegaard-Delta (`BD-Rate`), and hardware complexity (`MPix/s`, `MParams`, `kMACs/px`).
 
