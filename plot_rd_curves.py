@@ -1,4 +1,4 @@
-"""
+﻿"""
 plot_rd_curves.py
 -----------------
 Liest results_rms_conv.csv und results_rms_ai.csv ein, berechnet die
@@ -10,8 +10,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-conv_path = Path("results_rms_conv.csv")
-ai_path = Path("results_rms_ai.csv")
+conv_path = Path("results/pilot/results_rms_conv.csv")
+ai_path = Path("results/pilot/results_rms_ai.csv")
 
 if not conv_path.exists():
     raise FileNotFoundError(f"Datei nicht gefunden: {conv_path}")
@@ -82,6 +82,6 @@ ax2.set_ylabel("MS-SSIM", fontsize=11)
 plt.suptitle("WSI Ground-Truth Benchmark (IDC RMS Cohort, JPEG 2000 Lossless .90)", fontsize=14, y=0.98)
 plt.tight_layout()
 
-out_plot = Path("rd_curves_rms_groundtruth.png")
+out_plot = Path("results/pilot/rd_curves_rms_groundtruth.png")
 plt.savefig(out_plot, dpi=300)
 print(f"R-D Kurven erfolgreich generiert und gespeichert: {out_plot.resolve()}")

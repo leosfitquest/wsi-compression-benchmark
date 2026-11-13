@@ -40,6 +40,6 @@ for ax, (title, img, subtitle) in zip(axes, panels):
 plt.suptitle("H&E Whole Slide Image Tile (256x256 px, Level-0) â€” Visual Comparison @ ~0.25 bpp", fontsize=12, fontweight="bold", y=1.08)
 plt.tight_layout()
 
-out_path = Path("he_showcase.png")
+out_path = Path("results/pilot/he_showcase.png")
 plt.savefig(out_path, dpi=250, bbox_inches="tight")
 print(f"H&E showcase saved to: {out_path.resolve()}")

@@ -1,34 +1,32 @@
-wsi_io.py
-wsi_io/
-*.zip
-local_config.py
-*.env
-*.svs
-*.dcm
-*.tif
-*.tiff
-idc_rms_*
-TCGA-*
-tiles_*
-*.png
-!rd_curves_*.png
+﻿# Byte-compiled / cache
 __pycache__/
 *.py[cod]
-.ipynb_checkpoints/
+*.class
 .venv/
 venv/
-results_*.csv
+.env
 
-# Private Notizen & Excel-Tabellen
-Todo/
+# Raw WSI slides & local extracted tile folders (never commit raw medical data)
+*.svs
+*.dcm
+*.ndpi
+*.scn
+*.mrxs
+*.tif
+*.tiff
+*.bif
+tiles_*/
+idc_*/
+curated_data/
+curated_tiles/
+wsi_io.py
 
-# Instituts-Notebook & Temp-Dateien
-example_usage/example_usage.ipynb
-**/__MACOSX/
-example_usage/djfsjfhc.md
-
-!complexity_*.png
-
-!he_showcase.png
-
-!results_*.csv
+# Ignore stray images/CSVs in root, but explicitly track results/ subfolders
+*.png
+*.jpg
+*.csv
+!results/pilot/*.png
+!results/pilot/*.csv
+!results/curated_v1/*.png
+!results/curated_v1/*.csv
+!results/curated_v1/.gitkeep

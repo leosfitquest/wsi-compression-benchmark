@@ -1,4 +1,4 @@
-"""
+﻿"""
 complexity_tracker.py
 ---------------------
 Misst die rechentechnische Komplexitaet (Computational Complexity) aller
@@ -275,7 +275,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ai-quality", type=int, default=3, help="Quality-Stufe fuer CompressAI (1-6)")
     p.add_argument("--models", nargs="+", default=["bmshj2018-hyperprior", "cheng2020-attn"])
     p.add_argument("--jxl-effort", type=int, default=7)
-    p.add_argument("--out", type=Path, default=Path(__file__).with_name("results_complexity.csv"))
+    p.add_argument("--out", type=Path, default=Path(__file__).with_name("results/pilot/results_complexity.csv"))
     return p.parse_args()
 
 

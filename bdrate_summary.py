@@ -1,4 +1,4 @@
-"""
+﻿"""
 bdrate_summary.py
 -----------------
 Computes Bjontegaard-Delta Rate (BD-Rate in %) and BD-PSNR (in dB)
@@ -121,12 +121,12 @@ def evaluate_cohort(cohort_name: str, conv_csv: Path, ai_csv: Path, out_csv: Pat
 
 
 if __name__ == "__main__":
-    rms_conv = Path("results_rms_conv.csv")
-    rms_ai = Path("results_rms_ai.csv")
+    rms_conv = Path("results/pilot/results_rms_conv.csv")
+    rms_ai = Path("results/pilot/results_rms_ai.csv")
     if rms_conv.exists():
-        evaluate_cohort("IDC RMS (Lossless Ground-Truth)", rms_conv, rms_ai, Path("results_bdrate_rms.csv"))
+        evaluate_cohort("IDC RMS (Lossless Ground-Truth)", rms_conv, rms_ai, Path("results/pilot/results_bdrate_rms.csv"))
 
-    tcga_conv = Path("results_tcga256_conv.csv")
-    tcga_ai = Path("results_tcga256_ai.csv")
+    tcga_conv = Path("results/pilot/results_tcga256_conv.csv")
+    tcga_ai = Path("results/pilot/results_tcga256_ai.csv")
     if tcga_conv.exists():
-        evaluate_cohort("TCGA-LUAD (Scanner Q=70 Pre-Compressed)", tcga_conv, tcga_ai, Path("results_bdrate_tcga.csv"))
+        evaluate_cohort("TCGA-LUAD (Scanner Q=70 Pre-Compressed)", tcga_conv, tcga_ai, Path("results/pilot/results_bdrate_tcga.csv"))

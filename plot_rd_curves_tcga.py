@@ -1,4 +1,4 @@
-"""
+﻿"""
 plot_rd_curves_tcga.py
 Erstellt R-D-Kurven (bpp vs. PSNR / MS-SSIM) fuer den vorkomprimierten
 TCGA-Datensatz (results_tcga256_conv.csv und results_tcga256_ai.csv).
@@ -7,8 +7,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
-conv_path = Path("results_tcga256_conv.csv")
-ai_path = Path("results_tcga256_ai.csv")
+conv_path = Path("results/pilot/results_tcga256_conv.csv")
+ai_path = Path("results/pilot/results_tcga256_ai.csv")
 
 if not conv_path.exists() or not ai_path.exists():
     raise FileNotFoundError("Erforderliche CSV-Dateien nicht gefunden (results_tcga256_conv.csv / results_tcga256_ai.csv).")
@@ -77,6 +77,6 @@ ax2.set_ylabel("MS-SSIM", fontsize=11)
 plt.suptitle("WSI Pilot Benchmark (TCGA-LUAD, Scanner JPEG Q=70 Baseline)", fontsize=14, y=0.98)
 plt.tight_layout()
 
-out_plot = Path("rd_curves_tcga_precompressed.png")
+out_plot = Path("results/pilot/rd_curves_tcga_precompressed.png")
 plt.savefig(out_plot, dpi=300)
 print(f"TCGA R-D Kurven erfolgreich generiert: {out_plot.resolve()}")

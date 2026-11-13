@@ -1,4 +1,4 @@
-"""
+﻿"""
 benchmark_compressai.py
 -----------------------
 Rate-distortion benchmark of pretrained CompressAI models on RGB tiles.

@@ -1,4 +1,4 @@
-"""
+﻿"""
 plot_complexity.py
 ------------------
 Visualizes the results from results_complexity.csv in two scientific subplots:
@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-csv_path = Path("results_complexity.csv")
+csv_path = Path("results/pilot/results_complexity.csv")
 if not csv_path.exists():
     raise FileNotFoundError(f"File not found: {csv_path}")
 
@@ -135,6 +135,6 @@ ax2.set_xlim(right=ax2.get_xlim()[1] * 4.0)
 plt.suptitle("WSI Computational Complexity Benchmark (256x256 Tiles, CPU Single-Pass)", fontsize=14, y=0.98)
 plt.tight_layout()
 
-out_plot = Path("complexity_comparison.png")
+out_plot = Path("results/pilot/complexity_comparison.png")
 plt.savefig(out_plot, dpi=300)
 print(f"Complexity plot successfully saved: {out_plot.resolve()}")

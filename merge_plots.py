@@ -1,4 +1,4 @@
-"""
+﻿"""
 merge_plots.py
 Fuegt rd_curves_tcga_precompressed.png und rd_curves_rms_groundtruth.png
 vertikal zu einer zusammenfassenden Vergleichsgrafik zusammen.
@@ -6,8 +6,8 @@ vertikal zu einer zusammenfassenden Vergleichsgrafik zusammen.
 from PIL import Image
 from pathlib import Path
 
-tcga_img = Path("rd_curves_tcga_precompressed.png")
-rms_img = Path("rd_curves_rms_groundtruth.png")
+tcga_img = Path("results/pilot/rd_curves_tcga_precompressed.png")
+rms_img = Path("results/pilot/rd_curves_rms_groundtruth.png")
 
 if tcga_img.exists() and rms_img.exists():
     im1 = Image.open(tcga_img)
@@ -21,6 +21,6 @@ if tcga_img.exists() and rms_img.exists():
     merged.paste(im1, (0, 0))
     merged.paste(im2, (0, im1.height))
     
-    out_path = Path("rd_curves_combined_comparison.png")
+    out_path = Path("results/pilot/rd_curves_combined_comparison.png")
     merged.save(out_path, dpi=(300, 300))
     print(f"Kombinierter Vergleichs-Plot gespeichert: {out_path.resolve()}")

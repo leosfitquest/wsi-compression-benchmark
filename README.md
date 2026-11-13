@@ -1,8 +1,8 @@
-# Whole Slide Image (WSI) Compression Benchmark
+﻿# Whole Slide Image (WSI) Compression Benchmark
 
 A modular Rate-Distortion (R-D) and Computational Complexity benchmarking suite for evaluating **conventional image codecs** (`JPEG`, `JPEG 2000`, `WebP`, `JPEG XL`, `AVIF`) and **learned neural compression models** (`CompressAI`) on histopathology Whole Slide Images (H&E).
 
-![H&E Visual Showcase](example_usage/he_showcase.png)
+![H&E Visual Showcase](results/pilot/he_showcase.png)
 
 ---
 
@@ -52,9 +52,8 @@ flowchart LR
 pip install numpy pandas matplotlib Pillow imagecodecs torch torchvision compressai openslide-python idc-index
 
 # 2. Run benchmarks on extracted 256x256 tiles
-cd example_usage
-python benchmark_conventional.py --tiles-dir tiles_rms_lossless_256 --out results_rms_conv.csv
-python benchmark_compressai.py --tiles-dir tiles_rms_lossless_256 --out results_rms_ai.csv
+python benchmark_conventional.py --tiles-dir tiles_rms_lossless_256 --out results/pilot/results_rms_conv.csv
+python benchmark_compressai.py --tiles-dir tiles_rms_lossless_256 --out results/pilot/results_rms_ai.csv
 
 # 3. Generate plots, complexity metrics, and BD-Rate summary
 python plot_rd_curves.py

@@ -1,4 +1,4 @@
-"""
+﻿"""
 benchmark_conventional.py
 -------------------------
 Rate-distortion benchmark of conventional codecs on RGB tiles.
