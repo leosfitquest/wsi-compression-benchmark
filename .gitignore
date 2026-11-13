@@ -30,3 +30,12 @@ wsi_io.py
 !results/curated_v1/*.png
 !results/curated_v1/*.csv
 !results/curated_v1/.gitkeep
+
+# Local working files & archives
+Todo/
+__MACOSX/
+wsi_io/
+*.zip
+*.ipynb
+*.xlsx
+djfsjfhc.md
