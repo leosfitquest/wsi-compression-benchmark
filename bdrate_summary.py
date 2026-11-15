@@ -62,7 +62,13 @@ def prepare_curves(conv_csv: Path, ai_csv: Path) -> dict[str, pd.DataFrame]:
     curves: dict[str, pd.DataFrame] = {}
 
     df_conv = pd.read_csv(conv_csv)
-    conv_grouped = df_conv.groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]].mean().reset_index()
+    conv_grouped = (
+        df_conv.groupby(["codec", "target_bpp"])
+        .filter(lambda g: g["within_tolerance"].all())
+        .groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]]
+        .mean()
+        .reset_index()
+    )
     for codec, grp in conv_grouped.groupby("codec"):
         grp = grp.sort_values("bpp")
         grp = grp.loc[grp["bpp"].round(3).drop_duplicates(keep="last").index]

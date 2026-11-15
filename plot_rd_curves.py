@@ -17,7 +17,13 @@ if not conv_path.exists():
     raise FileNotFoundError(f"Datei nicht gefunden: {conv_path}")
 
 df_conv = pd.read_csv(conv_path)
-conv_grouped = df_conv.groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]].mean().reset_index()
+conv_grouped = (
+    df_conv.groupby(["codec", "target_bpp"])
+    .filter(lambda g: g["within_tolerance"].all())
+    .groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]]
+    .mean()
+    .reset_index()
+)
 
 # Farb-, Marker- und Linien-Styles fuer alle 6 konventionellen Codecs
 styles = {

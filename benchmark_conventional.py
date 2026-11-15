@@ -445,7 +445,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tile-size", type=int, default=256, help="synthetic tile size (224 or 256)")
     p.add_argument("--targets", type=float, nargs="+", default=list(DEFAULT_TARGETS_BPP))
     p.add_argument("--jxl-effort", type=int, default=7)
-    p.add_argument("--out", type=Path, default=Path(__file__).with_name("results_conventional.csv"))
+    p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "results" / "pilot" / "results_rms_conv.csv")
     return p.parse_args()
 
 

@@ -16,8 +16,14 @@ if not conv_path.exists() or not ai_path.exists():
 df_conv = pd.read_csv(conv_path)
 df_ai = pd.read_csv(ai_path)
 
-# Mittelwerte ueber alle 5 Kacheln berechnen
-conv_grouped = df_conv.groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]].mean().reset_index()
+# Mittelwerte ueber alle 5 Kacheln berechnen (nur nicht-gesaettigte Zielbitraten)
+conv_grouped = (
+    df_conv.groupby(["codec", "target_bpp"])
+    .filter(lambda g: g["within_tolerance"].all())
+    .groupby(["codec", "target_bpp"])[["bpp", "psnr_db", "ms_ssim"]]
+    .mean()
+    .reset_index()
+)
 ai_grouped = df_ai.groupby(["model", "quality"])[["bpp_real", "psnr_db", "ms_ssim"]].mean().reset_index()
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), dpi=300)

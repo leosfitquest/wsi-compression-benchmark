@@ -4,24 +4,21 @@ complexity_tracker.py
 Misst die rechentechnische Komplexitaet (Computational Complexity) aller
 konventionellen Codecs und neuronalen CompressAI-Modelle auf RGB-Kacheln:
 
-    - Enkodier- und Dekodierzeit (ms) ohne Bisektions- und Profiler-Overhead
+    - Enkodier- und Dekodierzeit (ms) ohne Bisektions- und Profiler-Overhead (Median aus 3 Laeufen nach Warmup)
     - Durchsatz in Megapixel pro Sekunde (MPix/s)
-    - Peak-Speicherallokation im RAM (MB) via Python tracemalloc
-    - Modellgroesse (MParams) und Rechenoperationen (kMACs/px) via PyTorch Hooks
+    - Modellgroesse (MParams) und Gesamt-Rechenoperationen (tot kMACs/px: Enc + Dec + Hyperprior/Context) via PyTorch Hooks
 
-Aufruf im Ordner example_usage:
-    python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 3
+Aufruf im Hauptverzeichnis:
+    python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 5
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import gc
-import tracemalloc
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -57,7 +54,6 @@ class ComplexityRow:
     dec_ms: float
     enc_mpix_s: float
     dec_mpix_s: float
-    peak_ram_mb: float
     params_m: float | None
     kmacs_per_px: float | None
 
@@ -65,7 +61,7 @@ class ComplexityRow:
 def count_macs_and_params(
     model: nn.Module, x_padded: torch.Tensor, orig_hw: tuple[int, int]
 ) -> tuple[float, float]:
-    """Berechnet Parameter (in Mio.) und kMACs pro Original-Pixel via PyTorch-Hooks."""
+    """Berechnet Parameter (in Mio.) und Gesamt-kMACs pro Original-Pixel (Forward-Pass) via PyTorch-Hooks."""
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     macs_list: list[int] = []
 
@@ -106,9 +102,15 @@ def measure_conventional(
     rows: list[ComplexityRow] = []
 
     for codec in codecs:
-        bpp_vals, psnr_vals, enc_vals, dec_vals, ram_vals = [], [], [], [], []
+        bpp_vals, psnr_vals, enc_vals, dec_vals = [], [], [], []
         last_param = 0.0
         backend_str = ""
+
+        # Warmup-Durchlauf auf der ersten Kachel
+        try:
+            _, _ = match_target_bpp(codec, tiles[0][1], target_bpp)
+        except (CodecUnavailableError, RateControlError):
+            pass
 
         for tile_id, tile in tiles:
             h, w = tile.shape[:2]
@@ -121,7 +123,7 @@ def measure_conventional(
 
             last_param = best_param
 
-            # 2a. Reine Zeitmessung OHNE tracemalloc-Overhead
+            # 2. Reine Zeitmessung (Median ueber repeats Durchlaeufe)
             t_enc_list, t_dec_list = [], []
             enc_res = None
             for _ in range(repeats):
@@ -129,20 +131,12 @@ def measure_conventional(
                 t_enc_list.append(enc_res.enc_s)
                 t_dec_list.append(enc_res.dec_s)
 
-            # 2b. Separater Durchlauf fuer die RAM-Messung
-            gc.collect()
-            tracemalloc.start()
-            _ = codec.encode_decode(tile, best_param)
-            _, peak_bytes = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
-
             assert enc_res is not None
             backend_str = enc_res.backend
             bpp_vals.append(bits_per_pixel(enc_res.num_bytes, h, w))
             psnr_vals.append(psnr_rgb(tile, enc_res.decoded))
             enc_vals.append(float(np.median(t_enc_list)))
             dec_vals.append(float(np.median(t_dec_list)))
-            ram_vals.append(peak_bytes / (1024.0 * 1024.0))
 
         if not bpp_vals:
             continue
@@ -163,7 +157,6 @@ def measure_conventional(
             dec_ms=round(mean_dec_s * 1e3, 2),
             enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 2),
             dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 2),
-            peak_ram_mb=round(float(np.max(ram_vals)), 2),
             params_m=None,
             kmacs_per_px=None,
         )
@@ -178,6 +171,7 @@ def measure_compressai(
     models: Sequence[str],
     quality: int,
     metric: str = "mse",
+    repeats: int = 3,
 ) -> list[ComplexityRow]:
     rows: list[ComplexityRow] = []
     cpu = torch.device("cpu")
@@ -189,28 +183,29 @@ def measure_compressai(
         first_x, first_hw = pad_to_multiple(tile_to_tensor(tiles[0][1]))
         params_m, kmacs_px = count_macs_and_params(model, first_x, first_hw)
 
-        bpp_vals, psnr_vals, enc_vals, dec_vals, ram_vals = [], [], [], [], []
+        # Warmup-Durchlauf vor der Zeitmessung
+        _ = real_coding(model, first_x, first_hw)
 
-        for idx, (_, tile) in enumerate(tiles):
+        bpp_vals, psnr_vals, enc_vals, dec_vals = [], [], [], []
+
+        for _, tile in tiles:
             x, hw = pad_to_multiple(tile_to_tensor(tile))
 
-            # 1. Reine Zeitmessung OHNE tracemalloc-Overhead
-            num_bytes, x_hat, enc_s, dec_s = real_coding(model, x, hw)
+            # Reine Zeitmessung (Median ueber repeats Durchlaeufe, analog zu konventionellen Codecs)
+            t_enc_list, t_dec_list = [], []
+            num_bytes = 0
+            x_hat = None
+            for _ in range(repeats):
+                num_bytes, x_hat, enc_s, dec_s = real_coding(model, x, hw)
+                t_enc_list.append(enc_s)
+                t_dec_list.append(dec_s)
 
-            # 2. Separater RAM-Check auf der ersten Kachel
-            if idx == 0:
-                gc.collect()
-                tracemalloc.start()
-                _ = real_coding(model, x, hw)
-                _, peak_bytes = tracemalloc.get_traced_memory()
-                tracemalloc.stop()
-                ram_vals.append(peak_bytes / (1024.0 * 1024.0))
-
+            assert x_hat is not None
             rec = tensor_to_tile(x_hat)
             bpp_vals.append(bits_per_pixel(num_bytes, *hw))
             psnr_vals.append(psnr_rgb(tile, rec))
-            enc_vals.append(enc_s)
-            dec_vals.append(dec_s)
+            enc_vals.append(float(np.median(t_enc_list)))
+            dec_vals.append(float(np.median(t_dec_list)))
 
         mean_enc_s = float(np.mean(enc_vals))
         mean_dec_s = float(np.mean(dec_vals))
@@ -228,7 +223,6 @@ def measure_compressai(
             dec_ms=round(mean_dec_s * 1e3, 2),
             enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 3),
             dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 3),
-            peak_ram_mb=round(float(np.max(ram_vals)), 2),
             params_m=params_m,
             kmacs_per_px=kmacs_px,
         )
@@ -241,21 +235,22 @@ def measure_compressai(
 
 HEADER = (
     f"{'Codec / Model':<22} {'bpp':>6} {'PSNR':>6} {'enc ms':>8} {'dec ms':>8} "
-    f"{'enc MP/s':>9} {'dec MP/s':>9} {'RAM MB':>7} {'MParams':>8} {'kMAC/px':>8}"
+    f"{'enc MP/s':>9} {'dec MP/s':>9} {'MParams':>8} {'tot kMAC/px':>11}"
 )
 
 
 def _fmt_row(r: ComplexityRow) -> str:
     pm = f"{r.params_m:>8.2f}" if r.params_m is not None else f"{'-':>8}"
-    km = f"{r.kmacs_per_px:>8.1f}" if r.kmacs_per_px is not None else f"{'-':>8}"
+    km = f"{r.kmacs_per_px:>11.1f}" if r.kmacs_per_px is not None else f"{'-':>11}"
     return (
         f"{r.codec_or_model:<22} {r.bpp:>6.3f} {r.psnr_db:>6.2f} "
         f"{r.enc_ms:>8.1f} {r.dec_ms:>8.1f} {r.enc_mpix_s:>9.2f} {r.dec_mpix_s:>9.2f} "
-        f"{r.peak_ram_mb:>7.2f} {pm} {km}"
+        f"{pm} {km}"
     )
 
 
 def write_csv(rows: Sequence[ComplexityRow], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[fl.name for fl in fields(ComplexityRow)])
         writer.writeheader()
@@ -269,13 +264,18 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--synthetic", type=int, metavar="N", help="N synthetische Kacheln nutzen (Default 2)")
     src.add_argument("--tiles-dir", type=Path, help="Ordner mit verlustfreien PNG-Kacheln")
     p.add_argument("--pattern", default="*.png")
-    p.add_argument("--limit", type=int, default=3, help="Anzahl der Kacheln fuer den Durchsatz-Mittelwert")
+    p.add_argument("--limit", type=int, default=5, help="Anzahl der Kacheln fuer den Durchsatz-Mittelwert (Default 5)")
     p.add_argument("--tile-size", type=int, default=256)
+    p.add_argument("--repeats", type=int, default=3, help="Wiederholungen pro Kachel fuer den Median (Default 3)")
     p.add_argument("--target-bpp", type=float, default=0.36, help="Iso-Bitrate passend zu ai-quality=3 (~0.36 bpp)")
     p.add_argument("--ai-quality", type=int, default=3, help="Quality-Stufe fuer CompressAI (1-6)")
     p.add_argument("--models", nargs="+", default=["bmshj2018-hyperprior", "cheng2020-attn"])
     p.add_argument("--jxl-effort", type=int, default=7)
-    p.add_argument("--out", type=Path, default=Path(__file__).with_name("results/pilot/results_complexity.csv"))
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path(__file__).resolve().parent / "results" / "pilot" / "results_complexity.csv",
+    )
     return p.parse_args()
 
 
@@ -289,14 +289,14 @@ def main() -> None:
     if not tiles:
         raise RuntimeError("Keine Kacheln zum Benchmarken gefunden.")
 
-    print(f"Benchmarking Complexity auf {len(tiles)} Kachel(n) @ {tiles[0][1].shape[:2]} px...\n")
+    print(f"Benchmarking Complexity auf {len(tiles)} Kachel(n) @ {tiles[0][1].shape[:2]} px (repeats={args.repeats})...\n")
     print(HEADER)
     print("-" * len(HEADER))
 
     codecs = build_codecs(args.jxl_effort)
     rows: list[ComplexityRow] = []
-    rows.extend(measure_conventional(tiles, codecs, args.target_bpp))
-    rows.extend(measure_compressai(tiles, args.models, args.ai_quality))
+    rows.extend(measure_conventional(tiles, codecs, args.target_bpp, repeats=args.repeats))
+    rows.extend(measure_compressai(tiles, args.models, args.ai_quality, repeats=args.repeats))
 
     write_csv(rows, args.out)
 

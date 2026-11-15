@@ -175,6 +175,7 @@ def run_benchmark(
 
 
 def write_csv(rows: Sequence[ResultRow], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[fl.name for fl in fields(ResultRow)])
         writer.writeheader()
@@ -192,12 +193,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tile-size", type=int, default=256, help="synthetic tile size (224 or 256)")
     p.add_argument("--models", nargs="+", choices=sorted(QUALITY_RANGES),
                    default=["bmshj2018-hyperprior", "cheng2020-attn"])
-    p.add_argument("--qualities", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6])
+    p.add_argument("--qualities", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8])
     p.add_argument("--metric", choices=["mse", "ms-ssim"], default="mse",
                    help="distortion the pretrained weights were optimised for")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--estimate-only", action="store_true", help="skip real entropy coding (faster)")
-    p.add_argument("--out", type=Path, default=Path(__file__).with_name("results_compressai.csv"))
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path(__file__).resolve().parent / "results" / "pilot" / "results_rms_ai.csv",
+    )
     return p.parse_args()
 
 
