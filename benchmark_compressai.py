@@ -6,18 +6,11 @@ Rate-distortion benchmark of pretrained CompressAI models on RGB tiles.
 For each tile and quality level the script reports
     bpp_est   rate estimated from the model's likelihoods (-sum log2 p)
     bpp_real  rate of the actual bitstream produced by model.compress()
-    PSNR / MS-SSIM of the tile decoded from that real bitstream
+    PSNR / Y-PSNR / MS-SSIM of the tile decoded from that real bitstream
 using the same metrics module as benchmark_conventional.py.
 
-Device policy: the likelihood forward pass runs on the selected device (GPU if
-available); real entropy coding always runs on CPU, because GPU float
-non-determinism can desynchronise encoder and decoder (CompressAI itself warns
-about this for autoregressive models). Timings are therefore CPU timings, the
-same setting as Fischer et al. (Fig. 7).
-
-Usage (run from this folder, or use VS Code "Run Python File"):
-    python benchmark_compressai.py --synthetic 2
-    python benchmark_compressai.py --tiles-dir path/to/tiles --models bmshj2018-hyperprior --qualities 1 2 3 4 5 6 7 8
+Supports automatic checkpointing/resume and optional filtering via --manifest
+and --fast-subset-only for rapid CPU evaluation across patients.
 """
 
 from __future__ import annotations
@@ -37,17 +30,15 @@ try:
 except ImportError as exc:
     sys.exit(f"Missing dependency '{exc.name}'. Install with: pip install torch torchvision compressai")
 
-from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb
+from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_y
 from tiles import Tile, synthetic_tiles, tiles_from_dir
 
-# Pretrained quality levels available in compressai.zoo
 QUALITY_RANGES: dict[str, tuple[int, int]] = {
     "bmshj2018-factorized": (1, 8),
     "bmshj2018-hyperprior": (1, 8),
     "mbt2018-mean": (1, 8),
     "cheng2020-attn": (1, 6),
 }
-# g_a downsamples by 2^4, h_a by a further 2^2 -> spatial dims must be multiples of 64.
 PAD_MULTIPLE = 64
 
 
@@ -60,6 +51,7 @@ class ResultRow:
     bpp_est: float
     bpp_real: float | None
     psnr_db: float
+    psnr_y_db: float
     ms_ssim: float
     enc_s: float | None
     dec_s: float | None
@@ -79,7 +71,7 @@ def load_model(name: str, quality: int, metric: str, device: torch.device) -> to
     builder = getattr(zoo, name.replace("-", "_"))
     model = builder(quality=quality, metric=metric, pretrained=True, progress=True)
     model = model.eval().to(device)
-    model.update()  # ensures the CDF tables needed by compress()/decompress() exist
+    model.update()
     return model
 
 
@@ -123,7 +115,7 @@ def real_coding(model_cpu: torch.nn.Module, x_padded_cpu: torch.Tensor, hw: tupl
 
 
 HEADER = (f"{'tile':<14} {'model':<22} {'q':>2} {'bpp_est':>8} {'bpp_real':>8} "
-          f"{'PSNR':>7} {'MS-SSIM':>8} {'enc s':>7} {'dec s':>7}")
+          f"{'PSNR':>7} {'Y-PSNR':>7} {'MS-SSIM':>8} {'enc s':>7} {'dec s':>7}")
 
 
 def _fmt_row(r: ResultRow) -> str:
@@ -131,7 +123,32 @@ def _fmt_row(r: ResultRow) -> str:
     enc = f"{r.enc_s:>7.3f}" if r.enc_s is not None else f"{'-':>7}"
     dec = f"{r.dec_s:>7.3f}" if r.dec_s is not None else f"{'-':>7}"
     return (f"{r.tile_id:<14} {r.model:<22} {r.quality:>2} {r.bpp_est:>8.4f} {real} "
-            f"{r.psnr_db:>7.2f} {r.ms_ssim:>8.4f} {enc} {dec}")
+            f"{r.psnr_db:>7.2f} {r.psnr_y_db:>7.2f} {r.ms_ssim:>8.4f} {enc} {dec}")
+
+
+def _load_completed_keys(out_path: Path) -> set[tuple[str, str, int]]:
+    done: set[tuple[str, str, int]] = set()
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return done
+    try:
+        with out_path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                done.add((row["tile_id"], row["model"], int(row["quality"])))
+    except Exception:
+        pass
+    return done
+
+
+def _load_allowed_tiles_from_manifest(manifest_path: Path, fast_only: bool) -> set[str]:
+    allowed: set[str] = set()
+    with manifest_path.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("track") != "A":
+                continue
+            if fast_only and str(row.get("is_fast_subset", "")).lower() != "true":
+                continue
+            allowed.add(row["tile_id"])
+    return allowed
 
 
 def run_benchmark(
@@ -141,46 +158,70 @@ def run_benchmark(
     metric: str,
     device: torch.device,
     do_real_coding: bool,
+    out_path: Path | None = None,
+    resume: bool = True,
 ) -> list[ResultRow]:
     cpu = torch.device("cpu")
-    tile_list = list(tiles)  # each model is loaded once and applied to all tiles
+    tile_list = list(tiles)
     rows: list[ResultRow] = []
-    print(f"estimation device: {device} | entropy coding device: cpu")
+
+    done_keys = _load_completed_keys(out_path) if (out_path and resume) else set()
+    if done_keys and out_path is not None:
+        print(f"[Resume] Found {len(done_keys)} completed entries in {out_path.name} -> skipping them.")
+
+    csv_file = None
+    writer = None
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not done_keys
+        csv_file = out_path.open("a" if done_keys else "w", newline="", encoding="utf-8")
+        writer = csv.DictWriter(csv_file, fieldnames=[fl.name for fl in fields(ResultRow)])
+        if write_header:
+            writer.writeheader()
+            csv_file.flush()
+
+    print(f"estimation device: {device} | entropy coding device: cpu | tiles: {len(tile_list)}")
     print(HEADER)
     print("-" * len(HEADER))
-    for name in models:
-        lo, hi = QUALITY_RANGES[name]
-        for q in qualities:
-            if not lo <= q <= hi:
-                print(f"[skip] {name} has no quality {q} (valid range {lo}-{hi})")
-                continue
-            est_model = load_model(name, q, metric, device)
-            code_model = est_model if device.type == "cpu" else load_model(name, q, metric, cpu)
-            for tile_id, tile in tile_list:
-                x, hw = pad_to_multiple(tile_to_tensor(tile))
-                bpp_est, x_hat = estimate_rate(est_model, x.to(device), hw)
-                bpp_real = enc_s = dec_s = None
-                if do_real_coding:
-                    num_bytes, x_hat, enc_s, dec_s = real_coding(code_model, x, hw)
-                    bpp_real = bits_per_pixel(num_bytes, *hw)
-                rec = tensor_to_tile(x_hat)
-                row = ResultRow(tile_id, name, q, device.type, bpp_est, bpp_real,
-                                psnr_rgb(tile, rec), ms_ssim_rgb(tile, rec), enc_s, dec_s)
-                rows.append(row)
-                print(_fmt_row(row))
-            del est_model, code_model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+    try:
+        for name in models:
+            lo, hi = QUALITY_RANGES[name]
+            for q in qualities:
+                if not lo <= q <= hi:
+                    print(f"[skip] {name} has no quality {q} (valid range {lo}-{hi})")
+                    continue
+                pending_tiles = [(tid, t) for tid, t in tile_list if (tid, name, q) not in done_keys]
+                if not pending_tiles:
+                    continue
+                est_model = load_model(name, q, metric, device)
+                code_model = est_model if device.type == "cpu" else load_model(name, q, metric, cpu)
+                for tile_id, tile in pending_tiles:
+                    x, hw = pad_to_multiple(tile_to_tensor(tile))
+                    bpp_est, x_hat = estimate_rate(est_model, x.to(device), hw)
+                    bpp_real = enc_s = dec_s = None
+                    if do_real_coding:
+                        num_bytes, x_hat, enc_s, dec_s = real_coding(code_model, x, hw)
+                        bpp_real = bits_per_pixel(num_bytes, *hw)
+                    rec = tensor_to_tile(x_hat)
+                    row = ResultRow(
+                        tile_id, name, q, device.type, bpp_est, bpp_real,
+                        psnr_rgb(tile, rec), psnr_y(tile, rec), ms_ssim_rgb(tile, rec), enc_s, dec_s
+                    )
+                    rows.append(row)
+                    if writer is not None and csv_file is not None:
+                        writer.writerow(asdict(row))
+                        csv_file.flush()
+                    print(_fmt_row(row))
+                del est_model, code_model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+
+    if out_path is not None:
+        print(f"\n+{len(rows)} new rows written to {out_path} (total: {len(done_keys) + len(rows)})")
     return rows
-
-
-def write_csv(rows: Sequence[ResultRow], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[fl.name for fl in fields(ResultRow)])
-        writer.writeheader()
-        writer.writerows(asdict(r) for r in rows)
-    print(f"\n{len(rows)} rows written to {path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--tiles-dir", type=Path, help="folder of lossless PNG/TIFF tiles")
     p.add_argument("--pattern", default="*.png")
     p.add_argument("--limit", type=int)
+    p.add_argument("--manifest", type=Path, help="optional manifest_track_a.csv to filter tiles")
+    p.add_argument("--fast-subset-only", action="store_true", help="only run tiles with is_fast_subset=True in manifest")
     p.add_argument("--tile-size", type=int, default=256, help="synthetic tile size (224 or 256)")
     p.add_argument("--models", nargs="+", choices=sorted(QUALITY_RANGES),
                    default=["bmshj2018-hyperprior", "cheng2020-attn"])
@@ -198,10 +241,11 @@ def parse_args() -> argparse.Namespace:
                    help="distortion the pretrained weights were optimised for")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--estimate-only", action="store_true", help="skip real entropy coding (faster)")
+    p.add_argument("--no-resume", action="store_true", help="overwrite output CSV from scratch")
     p.add_argument(
         "--out",
         type=Path,
-        default=Path(__file__).resolve().parent / "results" / "pilot" / "results_rms_ai.csv",
+        default=Path(__file__).resolve().parent / "results" / "curated_v1" / "results_rms_ai.csv",
     )
     return p.parse_args()
 
@@ -209,12 +253,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.tiles_dir:
-        tiles = tiles_from_dir(args.tiles_dir, args.pattern, args.limit)
+        tiles = list(tiles_from_dir(args.tiles_dir, args.pattern, None))
+        if args.manifest and args.manifest.exists():
+            allowed = _load_allowed_tiles_from_manifest(args.manifest, args.fast_subset_only)
+            tiles = [(tid, t) for tid, t in tiles if tid in allowed]
+        if args.limit:
+            tiles = tiles[: args.limit]
     else:
-        tiles = synthetic_tiles(args.synthetic or 2, args.tile_size)
-    rows = run_benchmark(tiles, args.models, args.qualities, args.metric,
-                         resolve_device(args.device), not args.estimate_only)
-    write_csv(rows, args.out)
+        tiles = list(synthetic_tiles(args.synthetic or 2, args.tile_size))
+
+    run_benchmark(
+        tiles, args.models, args.qualities, args.metric,
+        resolve_device(args.device), not args.estimate_only,
+        out_path=args.out, resume=not args.no_resume,
+    )
 
 
 if __name__ == "__main__":

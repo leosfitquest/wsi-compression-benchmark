@@ -6,7 +6,8 @@ konventionellen Codecs und neuronalen CompressAI-Modelle auf RGB-Kacheln:
 
     - Enkodier- und Dekodierzeit (ms) ohne Bisektions- und Profiler-Overhead (Median aus 3 Laeufen nach Warmup)
     - Durchsatz in Megapixel pro Sekunde (MPix/s)
-    - Modellgroesse (MParams) und Gesamt-Rechenoperationen (tot kMACs/px: Enc + Dec + Hyperprior/Context) via PyTorch Hooks
+    - Prozess-RAM (RSS MB via psutil, inkl. C/C++ & PyTorch ATen) und GPU-VRAM (MB via torch.cuda)
+    - Modellgroesse (MParams) und Gesamt-Rechenoperationen (tot kMACs/px) via PyTorch Hooks
 
 Aufruf im Hauptverzeichnis:
     python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 5
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Sequence
@@ -23,6 +25,13 @@ from typing import Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+
+try:
+    import psutil
+    _PROC = psutil.Process(os.getpid())
+except ImportError:
+    psutil = None
+    _PROC = None
 
 from benchmark_compressai import (
     load_model,
@@ -42,6 +51,20 @@ from metrics import bits_per_pixel, psnr_rgb
 from tiles import Tile, synthetic_tiles, tiles_from_dir
 
 
+def _rss_mb() -> float:
+    """Aktueller physischer Prozess-Speicher (Resident Set Size) in MB inkl. C/C++-Libs."""
+    if _PROC is not None:
+        return round(_PROC.memory_info().rss / (1024.0 * 1024.0), 1)
+    return 0.0
+
+
+def _vram_mb() -> float:
+    """Peak GPU-VRAM-Allokation in MB (falls CUDA aktiv ist)."""
+    if torch.cuda.is_available():
+        return round(torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), 1)
+    return 0.0
+
+
 @dataclass(frozen=True)
 class ComplexityRow:
     codec_or_model: str
@@ -54,6 +77,8 @@ class ComplexityRow:
     dec_ms: float
     enc_mpix_s: float
     dec_mpix_s: float
+    rss_ram_mb: float
+    vram_mb: float
     params_m: float | None
     kmacs_per_px: float | None
 
@@ -102,11 +127,10 @@ def measure_conventional(
     rows: list[ComplexityRow] = []
 
     for codec in codecs:
-        bpp_vals, psnr_vals, enc_vals, dec_vals = [], [], [], []
+        bpp_vals, psnr_vals, enc_vals, dec_vals, rss_vals = [], [], [], [], []
         last_param = 0.0
         backend_str = ""
 
-        # Warmup-Durchlauf auf der ersten Kachel
         try:
             _, _ = match_target_bpp(codec, tiles[0][1], target_bpp)
         except (CodecUnavailableError, RateControlError):
@@ -115,7 +139,6 @@ def measure_conventional(
         for tile_id, tile in tiles:
             h, w = tile.shape[:2]
             try:
-                # 1. Optimalen Parameter fuer Ziel-Bitrate bestimmen
                 best_param, _ = match_target_bpp(codec, tile, target_bpp)
             except (CodecUnavailableError, RateControlError) as exc:
                 print(f"[skip] {codec.name} auf {tile_id}: {exc}")
@@ -123,7 +146,6 @@ def measure_conventional(
 
             last_param = best_param
 
-            # 2. Reine Zeitmessung (Median ueber repeats Durchlaeufe)
             t_enc_list, t_dec_list = [], []
             enc_res = None
             for _ in range(repeats):
@@ -131,6 +153,7 @@ def measure_conventional(
                 t_enc_list.append(enc_res.enc_s)
                 t_dec_list.append(enc_res.dec_s)
 
+            rss_vals.append(_rss_mb())
             assert enc_res is not None
             backend_str = enc_res.backend
             bpp_vals.append(bits_per_pixel(enc_res.num_bytes, h, w))
@@ -157,6 +180,8 @@ def measure_conventional(
             dec_ms=round(mean_dec_s * 1e3, 2),
             enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 2),
             dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 2),
+            rss_ram_mb=round(float(np.max(rss_vals)), 1),
+            vram_mb=0.0,
             params_m=None,
             kmacs_per_px=None,
         )
@@ -177,21 +202,22 @@ def measure_compressai(
     cpu = torch.device("cpu")
 
     for name in models:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         model = load_model(name, quality, metric, cpu)
 
-        # MACs und Parameter auf der ersten Kachel bestimmen
         first_x, first_hw = pad_to_multiple(tile_to_tensor(tiles[0][1]))
         params_m, kmacs_px = count_macs_and_params(model, first_x, first_hw)
 
         # Warmup-Durchlauf vor der Zeitmessung
         _ = real_coding(model, first_x, first_hw)
 
-        bpp_vals, psnr_vals, enc_vals, dec_vals = [], [], [], []
+        bpp_vals, psnr_vals, enc_vals, dec_vals, rss_vals = [], [], [], [], []
 
         for _, tile in tiles:
             x, hw = pad_to_multiple(tile_to_tensor(tile))
 
-            # Reine Zeitmessung (Median ueber repeats Durchlaeufe, analog zu konventionellen Codecs)
             t_enc_list, t_dec_list = [], []
             num_bytes = 0
             x_hat = None
@@ -200,6 +226,7 @@ def measure_compressai(
                 t_enc_list.append(enc_s)
                 t_dec_list.append(dec_s)
 
+            rss_vals.append(_rss_mb())
             assert x_hat is not None
             rec = tensor_to_tile(x_hat)
             bpp_vals.append(bits_per_pixel(num_bytes, *hw))
@@ -223,6 +250,8 @@ def measure_compressai(
             dec_ms=round(mean_dec_s * 1e3, 2),
             enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 3),
             dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 3),
+            rss_ram_mb=round(float(np.max(rss_vals)), 1),
+            vram_mb=_vram_mb(),
             params_m=params_m,
             kmacs_per_px=kmacs_px,
         )
@@ -235,7 +264,7 @@ def measure_compressai(
 
 HEADER = (
     f"{'Codec / Model':<22} {'bpp':>6} {'PSNR':>6} {'enc ms':>8} {'dec ms':>8} "
-    f"{'enc MP/s':>9} {'dec MP/s':>9} {'MParams':>8} {'tot kMAC/px':>11}"
+    f"{'enc MP/s':>9} {'dec MP/s':>9} {'RSS MB':>7} {'MParams':>8} {'tot kMAC/px':>11}"
 )
 
 
@@ -245,7 +274,7 @@ def _fmt_row(r: ComplexityRow) -> str:
     return (
         f"{r.codec_or_model:<22} {r.bpp:>6.3f} {r.psnr_db:>6.2f} "
         f"{r.enc_ms:>8.1f} {r.dec_ms:>8.1f} {r.enc_mpix_s:>9.2f} {r.dec_mpix_s:>9.2f} "
-        f"{pm} {km}"
+        f"{r.rss_ram_mb:>7.1f} {pm} {km}"
     )
 
 

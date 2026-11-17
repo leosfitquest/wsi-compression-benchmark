@@ -72,7 +72,7 @@ for ax in (ax1, ax2):
         linestyle="--",
         linewidth=1.3,
         alpha=0.75,
-        label="Scanner Baseline (Q=70, ~0.28 bpp)"
+        label="Reference Target (0.28 bpp, ~85:1)"
     )
     ax.grid(True, linestyle=":", alpha=0.6)
     ax.set_xlabel("Bitrate [bpp]", fontsize=11)

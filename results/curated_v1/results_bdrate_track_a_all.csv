@@ -1,0 +1,9 @@
+Cohort,Codec / Model,BD-Rate PSNR [%],BD-PSNR [dB],BD-PSNR [0.25-0.90] [dB],BD-Rate Y-PSNR [%],BD-Rate MS-SSIM [%],Min bpp,Max bpp
+Curated Track A - All Tiles,cheng2020-attn,-53.13,3.45,3.66,-52.76,-34.5,0.22,1.255
+Curated Track A - All Tiles,bmshj2018-hyperprior,-51.93,3.27,3.58,-47.23,-36.9,0.235,2.451
+Curated Track A - All Tiles,AVIF,-42.47,2.54,2.84,-39.82,-37.92,0.25,1.499
+Curated Track A - All Tiles,JPEG 2000,-40.36,2.03,2.29,-33.84,-34.13,0.12,1.499
+Curated Track A - All Tiles,JPEG XL,-33.83,1.95,2.19,-29.22,-28.71,0.255,1.5
+Curated Track A - All Tiles,WebP,-11.01,0.53,0.72,-18.21,-9.42,0.5,1.499
+Curated Track A - All Tiles,JPEG 4:2:0,-4.73,0.26,0.46,-14.87,-6.23,0.251,1.499
+Curated Track A - All Tiles,JPEG 4:4:4,0.0,0.0,0.0,0.0,0.0,0.25,1.5

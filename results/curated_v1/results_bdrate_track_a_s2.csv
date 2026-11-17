@@ -1,0 +1,9 @@
+Cohort,Codec / Model,BD-Rate PSNR [%],BD-PSNR [dB],BD-PSNR [0.25-0.90] [dB],BD-Rate Y-PSNR [%],BD-Rate MS-SSIM [%],Min bpp,Max bpp
+Curated Track A - S2_basophilic,cheng2020-attn,-53.12,3.56,3.81,-50.97,-41.36,0.234,1.293
+Curated Track A - S2_basophilic,bmshj2018-hyperprior,-51.45,3.35,3.68,-45.59,-42.0,0.245,2.462
+Curated Track A - S2_basophilic,AVIF,-42.45,2.62,2.94,-39.74,-38.48,0.25,1.5
+Curated Track A - S2_basophilic,JPEG 2000,-40.66,2.11,2.39,-34.45,-35.2,0.12,1.499
+Curated Track A - S2_basophilic,JPEG XL,-34.15,2.03,2.29,-29.53,-29.25,0.257,1.5
+Curated Track A - S2_basophilic,WebP,-11.36,0.57,0.77,-18.79,-10.21,0.5,1.5
+Curated Track A - S2_basophilic,JPEG 4:2:0,-4.67,0.26,0.47,-14.81,-6.49,0.25,1.499
+Curated Track A - S2_basophilic,JPEG 4:4:4,0.0,0.0,0.0,0.0,0.0,0.25,1.5

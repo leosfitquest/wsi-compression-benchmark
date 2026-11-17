@@ -88,18 +88,58 @@ def tiles_from_dir(directory: Path | str, pattern: str = "*.png", limit: int | N
             yield path.stem, np.asarray(im.convert("RGB"), dtype=np.uint8).copy()
 
 
+def tiles_from_npy(
+    npy_path: Path | str,
+    types_npy_path: Path | str | None = None,
+    prefix: str = "pannuke",
+    limit: int | None = None,
+) -> Iterator[tuple[str, Tile]]:
+    """Stream 256x256 RGB tiles from a PanNuke .npy array (shape N, H, W, 3) via mmap_mode='r'.
+
+    Handles both uint8 and float64 (0..255) PanNuke storage formats without loading the
+    entire multi-gigabyte array into RAM at once.
+    """
+    npy_path = Path(npy_path)
+    if not npy_path.exists():
+        raise FileNotFoundError(f"NumPy tile file not found: {npy_path}")
+
+    arr = np.load(npy_path, mmap_mode="r")
+    if arr.ndim != 4 or arr.shape[-1] != 3:
+        raise ValueError(f"Expected (N, H, W, 3) array in {npy_path.name}, got {arr.shape}")
+
+    if types_npy_path is None:
+        candidate_types = npy_path.with_name("types.npy")
+        if candidate_types.exists():
+            types_npy_path = candidate_types
+
+    organ_types = None
+    if types_npy_path is not None and Path(types_npy_path).exists():
+        organ_types = np.load(types_npy_path, allow_pickle=True)
+
+    total = len(arr) if limit is None else min(len(arr), limit)
+    for idx in range(total):
+        raw = arr[idx]
+        if raw.dtype == np.uint8:
+            tile = np.asarray(raw, dtype=np.uint8).copy()
+        else:
+            tile = np.clip(np.round(raw), 0, 255).astype(np.uint8)
+
+        if organ_types is not None and idx < len(organ_types):
+            organ = str(organ_types[idx]).strip().replace(" ", "_")
+            tile_id = f"{prefix}_{idx:04d}_{organ}"
+        else:
+            tile_id = f"{prefix}_{idx:04d}"
+
+        yield tile_id, tile
+
+
 def tiles_from_wsi(
     slide_path: Path | str,
     coords_level0: Iterable[tuple[int, int]],
     size: int = 256,
     level: int = 0,
 ) -> Iterator[tuple[str, Tile]]:
-    """Read tiles straight from a slide with OpenSlide.
-
-    Adapter placeholder: replace the body with the equivalent call from your
-    wsi_io.py so that the benchmark uses the validated extraction pipeline.
-    Coordinates are in the level-0 reference frame (OpenSlide convention).
-    """
+    """Read tiles straight from a slide with OpenSlide."""
     import openslide  # imported lazily: only needed for this source
 
     stem = Path(slide_path).stem
