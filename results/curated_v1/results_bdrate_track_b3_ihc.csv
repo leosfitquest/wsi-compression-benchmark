@@ -1,0 +1,9 @@
+Codec / Model,Chroma Mode,BD-Rate RGB-PSNR [%],BD-Rate Y-PSNR [%],BD-Rate Chroma-PSNR [%],BD-Rate DAB-Stain-PSNR [%],BD-DAB-PSNR [dB]
+AVIF,YUV (AV1 Intra),-51.9,-40.95,-65.12,-65.61,3.38
+bmshj2018-hyperprior,Neural RGB Latent,-57.75,-47.84,-60.05,-62.38,3.26
+JPEG XL,XYB (Opsin Perceptual),-43.5,-29.73,-61.45,-61.45,2.85
+cheng2020-attn,Neural RGB Attention,-59.65,-55.63,-54.61,-51.11,2.91
+JPEG 2000,4:4:4 (ICT Wavelet),-42.13,-33.42,-47.47,-47.72,2.29
+JPEG 4:4:4,4:4:4 (Full Chroma),0.0,0.0,0.0,0.0,0.0
+WebP,4:2:0 (YUV420p),-14.08,-24.01,7.28,15.84,-0.53
+JPEG 4:2:0,4:2:0 (Subsampled),0.65,-15.29,35.88,34.66,-1.35
