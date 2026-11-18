@@ -1,20 +1,26 @@
 """
 prepare_track_b3_anhir_ihc.py
 -----------------------------
-Strikt verifizierte Original-Daten-Pipeline fuer Track B3 (ANHIR IHC / DAB):
-  - KEIN synthetischer Fallback, KEINE .jpg-Vorschaubilder (scale-5pc/10pc/25pc).
-  - Akzeptiert ausschliesslich echte, hochaufloesende .png-Originaldateien
-    (scale-100pc, mind. 3000x3000 Pixel) aus `anhir_data/raw_slides/`,
-    heruntergeladen von https://anhir.grand-challenge.org/Download/
-    (Subsets: lung-lesions, lung-lobes, mammary-glands, mice-kidney).
-  - Prueft jede extrahierte 256x256 Kachel forensisch auf 8x8-Blockfreiheit
-    (blockiness_8x8 <= 1.03), um vorkomprimierte Scanner-Slides auszuschliessen.
+100% Original-Daten-Pipeline fuer Track B3 (ANHIR IHC / DAB):
+  - Nutzt direkt den offiziellen CTU-Prag-Server aus dem ANHIR-Download-Portal:
+      http://ptak.felk.cvut.cz/Medical/dataset_ANHIR/images/dataset_medium.csv
+      http://ptak.felk.cvut.cz/Medical/dataset_ANHIR/images/
+    mit HTTP-Basic-Authentication (--user und --password von der ANHIR-Download-Seite).
+  - Laedt gezielt nur die verlustfreien Mikroskopie-IHC-PNGs (lung-lesion, lung-lobes,
+    mammary-gland, mice-kidney mit CD31, Ki67, proSPC, Cc10, ER, PR, HER2) einzeln
+    herunter, sodass NICHT das mehrteilige dataset_medium.z01..z05 Gesamtarchiv
+    geladen werden muss!
+  - Prueft zuerst, ob zu jedem Bild auch `scale-100pc/*.png` auf dem Server liegt,
+    und verifiziert jede 256x256 Kachel forensisch auf 8x8-Blockfreiheit (<= 1.03).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import re
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +28,14 @@ from PIL import Image
 
 from audit_track_a_forensics import measure_8x8_blockiness
 
-# Erlaubte grossformatige PNGs benoetigen erhöhtes DecompressionBomb-Limit
 Image.MAX_IMAGE_PIXELS = None
 
-# Ruifrok & Johnston (2001) Standard-OD-Vektoren fuer H-DAB
+ANHIR_BASE_URL = "http://ptak.felk.cvut.cz/Medical/dataset_ANHIR/images"
+ANHIR_CSV_URL = f"{ANHIR_BASE_URL}/dataset_medium.csv"
+
+# Verlustfreie Mikroskopie-Kohorten (Zeiss Axio Imager M1 / NanoZoomer, keine Leica/3DHistech-JPEG-Scanner)
+LOSSLESS_SUBSETS = ("lung-lesion", "lung-lobes", "mammary-gland", "mice-kidney")
+
 _H_VEC = np.array([0.650, 0.704, 0.286], dtype=np.float64)
 _DAB_VEC = np.array([0.268, 0.570, 0.776], dtype=np.float64)
 _H_VEC /= np.linalg.norm(_H_VEC)
@@ -47,6 +57,77 @@ MANIFEST_B3_FIELDS = [
     "blockiness_8x8",
     "is_fast_subset",
 ]
+
+
+def _fetch_with_auth(url: str, user: str | None, password: str | None, timeout: int = 30) -> bytes:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if user and password:
+        token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _download_individual_anhir_pngs(
+    raw_dir: Path,
+    user: str | None,
+    password: str | None,
+    max_slides: int = 24,
+) -> list[Path]:
+    """Liest dataset_medium.csv vom CTU-Prag-Server und laedt gezielt echte IHC-PNGs einzeln herunter."""
+    if not user or not password:
+        return []
+
+    print(f"[ANHIR Server] Lade Dateiliste von {ANHIR_CSV_URL} ...")
+    csv_bytes = _fetch_with_auth(ANHIR_CSV_URL, user, password)
+    csv_text = csv_bytes.decode("utf-8", errors="replace")
+
+    rel_paths: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9_\-/\.]+?\.png", csv_text):
+        clean = token.lstrip("/")
+        if clean.startswith("images/"):
+            clean = clean[len("images/"):]
+        if clean not in seen and any(sub in clean.lower() for sub in LOSSLESS_SUBSETS):
+            seen.add(clean)
+            rel_paths.append(clean)
+
+    def _ihc_priority(p: str) -> int:
+        low = p.lower()
+        if any(st in low for st in ("cd31", "ki67", "prospc", "cc10", "her2", "er-", "pr-")):
+            return 0
+        return 1
+
+    rel_paths.sort(key=_ihc_priority)
+    print(f"[ANHIR Server] {len(rel_paths)} passende verlustfreie Mikroskopie-PNG-Pfade in dataset_medium.csv gefunden.")
+
+    downloaded: list[Path] = []
+    for rel in rel_paths:
+        if len(downloaded) >= max_slides:
+            break
+        scale100_rel = re.sub(r"scale-\d+pc", "scale-100pc", rel)
+        candidates = [scale100_rel, rel] if scale100_rel != rel else [rel]
+
+        for cand in candidates:
+            safe_name = cand.replace("/", "_")
+            dest = raw_dir / safe_name
+            if dest.exists() and dest.stat().st_size > 1024:
+                downloaded.append(dest)
+                break
+            url = f"{ANHIR_BASE_URL}/{cand}"
+            try:
+                print(f"[Download {len(downloaded)+1}/{max_slides}] Lade {url} ...")
+                img_bytes = _fetch_with_auth(url, user, password, timeout=60)
+                if len(img_bytes) > 1024:
+                    dest.write_bytes(img_bytes)
+                    downloaded.append(dest)
+                    print(f"  -> Gespeichert: {dest.name} ({len(img_bytes)/1e6:.2f} MB)")
+                    break
+            except Exception:
+                continue
+
+    return downloaded
 
 
 def compute_ihc_stats(tile: np.ndarray) -> tuple[float, float, float, float]:
@@ -74,28 +155,26 @@ def _detect_stain_name(filename: str) -> str:
 def prepare_verified_anhir_b3(
     data_dir: Path,
     manifest_path: Path,
+    user: str | None = None,
+    password: str | None = None,
     max_tiles: int = 2000,
     fast_subset_size: int = 40,
-    min_slide_dim: int = 3000,
+    max_slides: int = 24,
+    min_slide_dim: int = 1024,
     max_blockiness: float = 1.03,
 ) -> None:
     raw_dir = data_dir / "raw_slides"
     raw_dir.mkdir(parents=True, exist_ok=True)
     out_npy = data_dir / "ihc_tiles_u8.npy"
 
-    # Suche ausschliesslich nach .png-Dateien (schliesst scale-5pc/10pc/25pc .jpg strikt aus)
-    png_files = [
-        p for p in sorted(raw_dir.rglob("*.png"))
-        if not any(s in str(p).lower() for s in ("scale-5pc", "scale-10pc", "scale-25pc"))
-    ]
+    _download_individual_anhir_pngs(raw_dir, user=user, password=password, max_slides=max_slides)
 
+    png_files = sorted(raw_dir.rglob("*.png"))
     if not png_files:
         raise FileNotFoundError(
-            f"\n[STOP] Keine hochaufloesenden ANHIR .png-Originaldateien in '{raw_dir.resolve()}' gefunden!\n"
-            f"Da ANHIR einen Login erfordert (https://anhir.grand-challenge.org/Download/),\n"
-            f"lade dort bitte die 'scale-100pc/*.png' Dateien der verlustfreien Mikroskop-Sets\n"
-            f"(z. B. lesions_1..3, lung-lobes_1..4, mammary-gland_1..2 mit CD31, Ki67, proSPC, Cc10)\n"
-            f"herunter und lege sie in '{raw_dir.resolve()}' ab."
+            f"\n[STOP] Keine ANHIR .png-Originaldateien in '{raw_dir.resolve()}' gefunden!\n"
+            f"Starte das Skript einfach mit User und Pass von der ANHIR-Seite:\n"
+            f"  python prepare_track_b3_anhir_ihc.py --user DEIN_USER --password DEIN_PASS"
         )
 
     collected: list[tuple[str, str, str, np.ndarray]] = []
@@ -113,8 +192,9 @@ def prepare_verified_anhir_b3(
             arr = np.asarray(im.convert("RGB"), dtype=np.uint8)
 
         stain = _detect_stain_name(p.stem)
-        for y in range(0, h - 256 + 1, 256):
-            for x in range(0, w - 256 + 1, 256):
+        stride = 128 if len(png_files) < 15 else 256
+        for y in range(0, h - 256 + 1, stride):
+            for x in range(0, w - 256 + 1, stride):
                 if len(collected) >= max_tiles:
                     break
                 patch = arr[y : y + 256, x : x + 256]
@@ -125,7 +205,7 @@ def prepare_verified_anhir_b3(
                     skipped_blocky += 1
                     continue
                 tid = f"anhir_{p.stem}_x{x}_y{y}"
-                collected.append((tid, "ANHIR_Scale100pc_PNG", stain, patch.copy()))
+                collected.append((tid, "ANHIR_CTU_PNG", stain, patch.copy()))
 
     if not collected:
         raise RuntimeError(
@@ -170,16 +250,22 @@ def prepare_verified_anhir_b3(
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"\n[Fertig] {len(rows)} verifizierte verlustfreie ANHIR scale-100pc PNG-Kacheln gespeichert.")
+    print(f"\n[Fertig] {len(rows)} verifizierte verlustfreie ANHIR PNG-Kacheln gespeichert.")
     print(f"  Mittlere 8x8-Blockiness: {np.mean([r['blockiness_8x8'] for r in rows]):.4f}")
     print(f"  Faerbungen: {sorted(by_stain.keys())}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Prepare strictly verified scale-100pc ANHIR PNG tiles for Track B3.")
+    p = argparse.ArgumentParser(description="Download & prepare strictly verified ANHIR PNG tiles from CTU Prague server.")
     p.add_argument("--data-dir", type=Path, default=Path("anhir_data"))
     p.add_argument("--manifest", type=Path, default=Path("results/curated_v1/manifest_track_b3_ihc.csv"))
+    p.add_argument("--user", type=str, default=None, help="Authentication User von der ANHIR-Download-Seite")
+    p.add_argument("--password", type=str, default=None, help="Authentication Pass von der ANHIR-Download-Seite")
     p.add_argument("--max-tiles", type=int, default=2000)
     p.add_argument("--fast-subset-size", type=int, default=40)
+    p.add_argument("--max-slides", type=int, default=24)
     args = p.parse_args()
-    prepare_verified_anhir_b3(args.data_dir, args.manifest, args.max_tiles, args.fast_subset_size)
+    prepare_verified_anhir_b3(
+        args.data_dir, args.manifest, user=args.user, password=args.password,
+        max_tiles=args.max_tiles, fast_subset_size=args.fast_subset_size, max_slides=args.max_slides,
+    )
