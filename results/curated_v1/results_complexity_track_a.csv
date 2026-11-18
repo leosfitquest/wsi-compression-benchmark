@@ -1,9 +1,9 @@
 codec_or_model,category,backend,setting,bpp,psnr_db,enc_ms,dec_ms,enc_mpix_s,dec_mpix_s,rss_ram_mb,vram_mb,params_m,kmacs_per_px
-JPEG 4:4:4,conventional,Pillow/libjpeg,target=0.36bpp (quality=7),0.3627,24.22,0.46,0.35,142.02,188.18,416.6,0.0,,
-JPEG 4:2:0,conventional,Pillow/libjpeg,target=0.36bpp (quality=8),0.358,24.9,0.34,0.35,190.26,187.15,417.2,0.0,,
-JPEG 2000,conventional,Pillow 12.3.0/OpenJPEG,target=0.36bpp (ratio=65.9478),0.3588,26.34,18.46,1.91,3.55,34.36,416.5,0.0,,
-JPEG XL,conventional,imagecodecs/libjxl (e7),target=0.36bpp (distance=11.4966),0.3614,25.97,35.17,3.36,1.86,19.51,429.2,0.0,,
-WebP,conventional,Pillow/libwebp,target=0.36bpp (quality=3),0.3592,25.68,8.99,1.23,7.29,53.2,416.9,0.0,,
-AVIF,conventional,imagecodecs/libavif,target=0.36bpp (quality=26),0.3575,26.78,45.92,0.83,1.43,78.86,421.0,0.0,,
-bmshj2018-hyperprior,neural,CompressAI/CPU (rANS),quality=3,0.4603,27.92,42.57,50.69,1.54,1.293,510.2,0.0,5.076,188.23
-cheng2020-attn,neural,CompressAI/CPU (rANS),quality=3,0.4318,27.89,452.48,1084.57,0.145,0.06,537.1,0.0,13.183,460.48
+JPEG 4:4:4,conventional,Pillow/libjpeg,target=0.36bpp (quality=7),0.3627,24.22,0.58,0.45,113.96,146.11,416.8,0.0,,
+JPEG 4:2:0,conventional,Pillow/libjpeg,target=0.36bpp (quality=8),0.358,24.9,0.36,0.39,179.81,169.84,417.6,0.0,,
+JPEG 2000,conventional,Pillow 12.3.0/OpenJPEG,target=0.36bpp (ratio=65.9478),0.3588,26.34,17.83,1.93,3.68,33.99,418.6,0.0,,
+JPEG XL,conventional,imagecodecs/libjxl (e7),target=0.36bpp (distance=11.4966),0.3614,25.97,38.13,3.76,1.72,17.44,430.4,0.0,,
+WebP,conventional,Pillow/libwebp,target=0.36bpp (quality=3),0.3592,25.68,12.93,1.7,5.07,38.57,429.6,0.0,,
+AVIF,conventional,imagecodecs/libavif,target=0.36bpp (quality=26),0.3575,26.78,53.74,0.93,1.22,70.48,422.1,0.0,,
+bmshj2018-hyperprior,neural,CompressAI/CPU (rANS),quality=3,0.4603,27.92,56.93,72.32,1.151,0.906,497.0,0.0,5.076,188.23
+cheng2020-attn,neural,CompressAI/CPU (rANS),quality=3,0.4318,27.89,571.74,1313.53,0.115,0.05,533.4,0.0,13.183,460.48
