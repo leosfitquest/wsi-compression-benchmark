@@ -39,3 +39,5 @@ wsi_io/
 *.ipynb
 *.xlsx
 djfsjfhc.md
+
+camelyon_data/
