@@ -30,7 +30,7 @@ Image.MAX_IMAGE_PIXELS = None
 ANHIR_BASE_URL = "http://ptak.felk.cvut.cz/Medical/dataset_ANHIR/images"
 ANHIR_CSV_URL = f"{ANHIR_BASE_URL}/dataset_medium.csv"
 
-LOSSLESS_SUBSETS = ("lung-lesion", "lung-lobes", "mammary-gland", "mice-kidney")
+LOSSLESS_SUBSETS = ("lung-lesion", "lung-lobes", "mammary-gland")
 
 _H_VEC = np.array([0.650, 0.704, 0.286], dtype=np.float64)
 _DAB_VEC = np.array([0.268, 0.570, 0.776], dtype=np.float64)

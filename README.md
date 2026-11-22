@@ -49,7 +49,7 @@ flowchart LR
 
 ```bash
 # 1. Install dependencies
-pip install numpy pandas matplotlib Pillow imagecodecs torch torchvision compressai openslide-python idc-index
+pip install numpy pandas matplotlib scipy Pillow imagecodecs torch torchvision compressai openslide-python pydicom psutil idc-index
 
 # 2. Run benchmarks on extracted 256x256 tiles
 python benchmark_conventional.py --tiles-dir tiles_rms_lossless_256 --out results/pilot/results_rms_conv.csv
@@ -57,7 +57,7 @@ python benchmark_compressai.py --tiles-dir tiles_rms_lossless_256 --out results/
 
 # 3. Generate plots, complexity metrics, and BD-Rate summary
 python plot_rd_curves.py
-python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 3
+python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 3 --out results/pilot/results_complexity.csv
 python plot_complexity.py
 python bdrate_summary.py
 ```
