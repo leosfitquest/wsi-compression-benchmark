@@ -4,27 +4,25 @@ complexity_tracker.py
 Misst die rechentechnische Komplexitaet (Computational Complexity) aller
 konventionellen Codecs und neuronalen CompressAI-Modelle auf RGB-Kacheln:
 
-    - Enkodier- und Dekodierzeit (ms) ohne Bisektions- und Profiler-Overhead (Median aus 3 Laeufen nach Warmup)
-    - Durchsatz in Megapixel pro Sekunde (MPix/s)
-    - Prozess-RAM (RSS MB via psutil, inkl. C/C++ & PyTorch ATen) und GPU-VRAM (MB via torch.cuda)
-    - Modellgroesse (MParams) und Gesamt-Rechenoperationen (tot kMACs/px) via PyTorch Hooks
-
-Aufruf im Hauptverzeichnis:
-    python complexity_tracker.py --tiles-dir tiles_rms_lossless_256 --limit 5
+- Faire Single-Thread-Paritaet (`--num-threads 1` fuer PyTorch/CompressAI wie bei JXL/AVIF)
+- Lazy-Import von PyTorch erst nach measure_conventional() -> keine PyTorch-RSS-Kontamination
+  bei den 6 konventionellen Codecs!
+- Korrekte MAC-Zaehlung fuer nn.Conv2d UND nn.ConvTranspose2d (Eingangsgroesse H_in*W_in statt H_out*W_out)
+- Durchsatz (MPix/s) berechnet aus der exakten Summe aller verarbeiteten Pixel
+- Einheitliche Iso-Bitrate (Default: 0.44 bpp passend zu CompressAI quality=3)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-import torch
-import torch.nn as nn
 
 try:
     import psutil
@@ -33,13 +31,6 @@ except ImportError:
     psutil = None
     _PROC = None
 
-from benchmark_compressai import (
-    load_model,
-    pad_to_multiple,
-    real_coding,
-    tensor_to_tile,
-    tile_to_tensor,
-)
 from benchmark_conventional import (
     Codec,
     CodecUnavailableError,
@@ -55,13 +46,6 @@ def _rss_mb() -> float:
     """Aktueller physischer Prozess-Speicher (Resident Set Size) in MB inkl. C/C++-Libs."""
     if _PROC is not None:
         return round(_PROC.memory_info().rss / (1024.0 * 1024.0), 1)
-    return 0.0
-
-
-def _vram_mb() -> float:
-    """Peak GPU-VRAM-Allokation in MB (falls CUDA aktiv ist)."""
-    if torch.cuda.is_available():
-        return round(torch.cuda.max_memory_allocated() / (1024.0 * 1024.0), 1)
     return 0.0
 
 
@@ -84,19 +68,30 @@ class ComplexityRow:
 
 
 def count_macs_and_params(
-    model: nn.Module, x_padded: torch.Tensor, orig_hw: tuple[int, int]
+    model, x_padded, orig_hw: tuple[int, int]
 ) -> tuple[float, float]:
-    """Berechnet Parameter (in Mio.) und Gesamt-kMACs pro Original-Pixel (Forward-Pass) via PyTorch-Hooks."""
+    """Berechnet Parameter (Mio.) und kMACs/px exakt fuer nn.Conv2d, nn.ConvTranspose2d und nn.Linear."""
+    import torch
+    import torch.nn as nn
+
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     macs_list: list[int] = []
 
     def conv_hook(module: nn.Module, inp: tuple[torch.Tensor, ...], out: torch.Tensor) -> None:
-        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+        if isinstance(module, nn.Conv2d):
             b, c_out, h_out, w_out = out.shape
             k_h, k_w = module.kernel_size
             c_in = module.in_channels
             groups = module.groups
             macs = b * c_out * h_out * w_out * (c_in // groups) * k_h * k_w
+            macs_list.append(int(macs))
+        elif isinstance(module, nn.ConvTranspose2d):
+            # Jeder Eingangs-Pixel (H_in x W_in) wird mit dem Kernel (k_h x k_w) fuer C_out/groups multipliziert
+            b, c_in, h_in, w_in = inp[0].shape
+            k_h, k_w = module.kernel_size
+            c_out = module.out_channels
+            groups = module.groups
+            macs = b * c_in * h_in * w_in * (c_out // groups) * k_h * k_w
             macs_list.append(int(macs))
         elif isinstance(module, nn.Linear):
             macs = inp[0].numel() * module.out_features
@@ -122,17 +117,22 @@ def measure_conventional(
     tiles: Sequence[tuple[str, Tile]],
     codecs: Sequence[Codec],
     target_bpp: float,
-    repeats: int = 3,
+    repeats: int = 5,
 ) -> list[ComplexityRow]:
     rows: list[ComplexityRow] = []
 
     for codec in codecs:
+        gc.collect()
         bpp_vals, psnr_vals, enc_vals, dec_vals, rss_vals = [], [], [], [], []
-        last_param = 0.0
+        param_vals: list[float] = []
+        pixel_counts: list[int] = []
         backend_str = ""
 
+        # Warmup (3 Laeufe gegen Windows-Timer- und Cache-Jitter)
         try:
-            _, _ = match_target_bpp(codec, tiles[0][1], target_bpp)
+            wp_param, _ = match_target_bpp(codec, tiles[0][1], target_bpp)
+            for _ in range(3):
+                _ = codec.encode_decode(tiles[0][1], wp_param)
         except (CodecUnavailableError, RateControlError):
             pass
 
@@ -144,7 +144,8 @@ def measure_conventional(
                 print(f"[skip] {codec.name} auf {tile_id}: {exc}")
                 continue
 
-            last_param = best_param
+            param_vals.append(best_param)
+            pixel_counts.append(h * w)
 
             t_enc_list, t_dec_list = [], []
             enc_res = None
@@ -164,22 +165,24 @@ def measure_conventional(
         if not bpp_vals:
             continue
 
+        total_mpix = sum(pixel_counts) / 1e6
+        total_enc_s = sum(enc_vals)
+        total_dec_s = sum(dec_vals)
         mean_enc_s = float(np.mean(enc_vals))
         mean_dec_s = float(np.mean(dec_vals))
-        h0, w0 = tiles[0][1].shape[:2]
-        mpix = (h0 * w0) / 1e6
+        med_param = float(np.median(param_vals))
 
         row = ComplexityRow(
             codec_or_model=codec.name,
             category="conventional",
             backend=backend_str,
-            setting=f"target={target_bpp:.2f}bpp ({codec.param_name}={last_param:g})",
+            setting=f"target={target_bpp:.2f}bpp ({codec.param_name}~{med_param:g})",
             bpp=round(float(np.mean(bpp_vals)), 4),
             psnr_db=round(float(np.mean(psnr_vals)), 2),
             enc_ms=round(mean_enc_s * 1e3, 2),
             dec_ms=round(mean_dec_s * 1e3, 2),
-            enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 2),
-            dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 2),
+            enc_mpix_s=round(total_mpix / max(total_enc_s, 1e-9), 2),
+            dec_mpix_s=round(total_mpix / max(total_dec_s, 1e-9), 2),
             rss_ram_mb=round(float(np.max(rss_vals)), 1),
             vram_mb=0.0,
             params_m=None,
@@ -197,14 +200,27 @@ def measure_compressai(
     quality: int,
     metric: str = "mse",
     repeats: int = 3,
+    num_threads: int = 1,
 ) -> list[ComplexityRow]:
+    # Lazy-Import von PyTorch/CompressAI erst NACH measure_conventional(),
+    # damit konventionelle Codecs nicht mit ~350 MB PyTorch-Basis-RSS kontaminiert werden.
+    import torch
+    from benchmark_compressai import (
+        load_model,
+        pad_to_multiple,
+        real_coding,
+        tensor_to_tile,
+        tile_to_tensor,
+    )
+
+    if num_threads > 0:
+        torch.set_num_threads(num_threads)
+
     rows: list[ComplexityRow] = []
     cpu = torch.device("cpu")
 
     for name in models:
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-
+        gc.collect()
         model = load_model(name, quality, metric, cpu)
 
         first_x, first_hw = pad_to_multiple(tile_to_tensor(tiles[0][1]))
@@ -214,8 +230,11 @@ def measure_compressai(
         _ = real_coding(model, first_x, first_hw)
 
         bpp_vals, psnr_vals, enc_vals, dec_vals, rss_vals = [], [], [], [], []
+        pixel_counts: list[int] = []
 
         for _, tile in tiles:
+            h, w = tile.shape[:2]
+            pixel_counts.append(h * w)
             x, hw = pad_to_multiple(tile_to_tensor(tile))
 
             t_enc_list, t_dec_list = [], []
@@ -234,30 +253,32 @@ def measure_compressai(
             enc_vals.append(float(np.median(t_enc_list)))
             dec_vals.append(float(np.median(t_dec_list)))
 
+        total_mpix = sum(pixel_counts) / 1e6
+        total_enc_s = sum(enc_vals)
+        total_dec_s = sum(dec_vals)
         mean_enc_s = float(np.mean(enc_vals))
         mean_dec_s = float(np.mean(dec_vals))
-        h0, w0 = tiles[0][1].shape[:2]
-        mpix = (h0 * w0) / 1e6
 
         row = ComplexityRow(
             codec_or_model=name,
             category="neural",
-            backend="CompressAI/CPU (rANS)",
+            backend=f"CompressAI/CPU-{num_threads}T (rANS)",
             setting=f"quality={quality}",
             bpp=round(float(np.mean(bpp_vals)), 4),
             psnr_db=round(float(np.mean(psnr_vals)), 2),
             enc_ms=round(mean_enc_s * 1e3, 2),
             dec_ms=round(mean_dec_s * 1e3, 2),
-            enc_mpix_s=round(mpix / max(mean_enc_s, 1e-9), 3),
-            dec_mpix_s=round(mpix / max(mean_dec_s, 1e-9), 3),
+            enc_mpix_s=round(total_mpix / max(total_enc_s, 1e-9), 3),
+            dec_mpix_s=round(total_mpix / max(total_dec_s, 1e-9), 3),
             rss_ram_mb=round(float(np.max(rss_vals)), 1),
-            vram_mb=_vram_mb(),
+            vram_mb=0.0,
             params_m=params_m,
             kmacs_per_px=kmacs_px,
         )
         rows.append(row)
         print(_fmt_row(row))
         del model
+        gc.collect()
 
     return rows
 
@@ -293,17 +314,18 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--synthetic", type=int, metavar="N", help="N synthetische Kacheln nutzen (Default 2)")
     src.add_argument("--tiles-dir", type=Path, help="Ordner mit verlustfreien PNG-Kacheln")
     p.add_argument("--pattern", default="*.png")
-    p.add_argument("--limit", type=int, default=5, help="Anzahl der Kacheln fuer den Durchsatz-Mittelwert (Default 5)")
+    p.add_argument("--limit", type=int, default=30, help="Anzahl der Kacheln fuer den Durchsatz-Mittelwert (Default 30)")
     p.add_argument("--tile-size", type=int, default=256)
     p.add_argument("--repeats", type=int, default=3, help="Wiederholungen pro Kachel fuer den Median (Default 3)")
-    p.add_argument("--target-bpp", type=float, default=0.36, help="Iso-Bitrate passend zu ai-quality=3 (~0.36 bpp)")
+    p.add_argument("--target-bpp", type=float, default=0.44, help="Iso-Bitrate passend zu ai-quality=3 (~0.44 bpp)")
     p.add_argument("--ai-quality", type=int, default=3, help="Quality-Stufe fuer CompressAI (1-6)")
+    p.add_argument("--num-threads", type=int, default=1, help="PyTorch CPU-Threads (Default 1 fuer faire Single-Core-Paritaet)")
     p.add_argument("--models", nargs="+", default=["bmshj2018-hyperprior", "cheng2020-attn"])
     p.add_argument("--jxl-effort", type=int, default=7)
     p.add_argument(
         "--out",
         type=Path,
-        default=Path(__file__).resolve().parent / "results" / "pilot" / "results_complexity.csv",
+        default=Path(__file__).resolve().parent / "results" / "curated_v1" / "results_complexity_track_a.csv",
     )
     return p.parse_args()
 
@@ -318,14 +340,21 @@ def main() -> None:
     if not tiles:
         raise RuntimeError("Keine Kacheln zum Benchmarken gefunden.")
 
-    print(f"Benchmarking Complexity auf {len(tiles)} Kachel(n) @ {tiles[0][1].shape[:2]} px (repeats={args.repeats})...\n")
+    print(
+        f"Benchmarking Complexity auf {len(tiles)} Kachel(n) @ {tiles[0][1].shape[:2]} px "
+        f"(repeats={args.repeats}, target={args.target_bpp:.2f} bpp, cpu_threads={args.num_threads})...\n"
+    )
     print(HEADER)
     print("-" * len(HEADER))
 
     codecs = build_codecs(args.jxl_effort)
     rows: list[ComplexityRow] = []
-    rows.extend(measure_conventional(tiles, codecs, args.target_bpp, repeats=args.repeats))
-    rows.extend(measure_compressai(tiles, args.models, args.ai_quality, repeats=args.repeats))
+    rows.extend(measure_conventional(tiles, codecs, args.target_bpp, repeats=max(5, args.repeats)))
+    rows.extend(
+        measure_compressai(
+            tiles, args.models, args.ai_quality, repeats=args.repeats, num_threads=args.num_threads
+        )
+    )
 
     write_csv(rows, args.out)
 

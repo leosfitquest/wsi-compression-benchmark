@@ -2,18 +2,19 @@
 prepare_track_a_rms.py
 ----------------------
 Baut Track A des Curated Test Sets (v1) gemaess Sheet 3 auf:
-  - Local CPU Pilot: 30 Patienten x 200 Level-0-Tiles (256x256) = 6.000 Tiles + 30 x 2048x2048 ROIs
-  - VUB GPU Full Run: 100 Patienten x 1.000 Level-0-Tiles (256x256) = 100.000 Tiles
-  - Strikter pydicom VOLUME-Audit (TransferSyntax .90 oder .2.1, LossyImageCompression == '00')
-  - 10x Speedup durch Vorfilterung leerer Glasflaechen auf der niedrigsten Pyramidenstufe
-  - Echte Ruifrok & Johnston (2001) H&E Farb-Dekonvolution fuer 50/50 Balancierung
-    zwischen S1 (Eosinophilic / Pink) und S2 (Basophilic / Blue)
+- Local CPU Pilot: 30 Patienten x 200 Level-0-Tiles (256x256) = 6.000 Tiles + 30 x 2048x2048 ROIs
+- VUB GPU Full Run: 100 Patienten x 1.000 Level-0-Tiles (256x256) = 100.000 Tiles
+- Strikter pydicom VOLUME-Audit (TransferSyntax .90 oder .2.1, LossyImageCompression == '00')
+- Resume-sicherer, patienten-deterministischer RNG (Hash aus seed + patient_id) & sortiertes rglob()
+- Stratifizierte Zufallsauswahl fuer `is_fast_subset` innerhalb S1 & S2 (kein Extremwert/Median-Bias!)
+- Echte Ruifrok-Werte fuer A_ROI (und `is_fast_subset=False`, damit `track == 'A'` sauber getrennt bleibt)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -57,6 +58,13 @@ MANIFEST_FIELDS = [
 ]
 
 
+def _patient_rng(base_seed: int, patient_id: str) -> np.random.Generator:
+    """Resume-sicherer, deterministischer RNG abgeleitet aus (base_seed, patient_id)."""
+    digest = hashlib.sha256(f"{base_seed}:{patient_id}".encode("utf-8")).digest()
+    seed_int = int.from_bytes(digest[:8], "little")
+    return np.random.default_rng(seed_int)
+
+
 def ruifrok_he_ratio(tile_rgb: np.ndarray, tissue_mask: np.ndarray) -> float:
     """Berechnet den relativen Haematoxylin-Anteil H / (H + E) auf den Gewebepixeln nach Ruifrok (2001)."""
     fg_pixels = tile_rgb[tissue_mask].astype(np.float64)
@@ -72,7 +80,7 @@ def ruifrok_he_ratio(tile_rgb: np.ndarray, tissue_mask: np.ndarray) -> float:
 def get_verified_volumes(dcm_root: Path) -> list[tuple[int, Path, str, str]]:
     """Findet alle verifizierten verlustfreien Level-0 VOLUME-Instanzen (>= 5000 px) in dcm_root."""
     vols: list[tuple[int, Path, str, str]] = []
-    for p in dcm_root.rglob("*.dcm"):
+    for p in sorted(dcm_root.rglob("*.dcm")):
         try:
             ds = pydicom.dcmread(p, stop_before_pixels=True)
         except Exception:
@@ -92,7 +100,7 @@ def get_verified_volumes(dcm_root: Path) -> list[tuple[int, Path, str, str]]:
         mpp = round((im_width_mm * 1000.0) / cols, 4) if im_width_mm > 0 and cols > 0 else 0.2526
         vols.append((cols * rows, p, ts, f"{mpp:.4f}"))
 
-    vols.sort(key=lambda t: t[0], reverse=True)
+    vols.sort(key=lambda t: (-t[0], str(t[1])))
     return vols
 
 
@@ -107,7 +115,6 @@ def _prefilter_coords_via_pyramid(
     """Filtert leere Glas-Koordinaten in <0.1s ueber die kleinste Pyramidenstufe vor."""
     thumb_arr = None
 
-    # 1. Versuch: Niedrigste Pyramidenstufe direkt aus OpenSlide (falls vorhanden und <= 4096 px)
     for lvl in range(slide.level_count - 1, 0, -1):
         wl, hl = slide.level_dimensions[lvl]
         if wl <= 4096 and hl <= 4096:
@@ -115,10 +122,9 @@ def _prefilter_coords_via_pyramid(
             thumb_arr = np.asarray(thumb_rgb, dtype=np.uint8)
             break
 
-    # 2. Fallback: Kleinste VOLUME- oder OVERVIEW-DICOM-Datei im selben Serienordner nutzen
     if thumb_arr is None:
         small_dcms = []
-        for p in dcm_dir.glob("*.dcm"):
+        for p in sorted(dcm_dir.glob("*.dcm")):
             try:
                 ds = pydicom.dcmread(p, stop_before_pixels=True)
                 c = int(getattr(ds, "TotalPixelMatrixColumns", 0))
@@ -128,7 +134,7 @@ def _prefilter_coords_via_pyramid(
             except Exception:
                 continue
         if small_dcms:
-            small_dcms.sort(key=lambda t: t[0])
+            small_dcms.sort(key=lambda t: (t[0], str(t[1])))
             try:
                 with openslide.OpenSlide(str(small_dcms[0][1])) as s_low:
                     wl, hl = s_low.dimensions
@@ -149,7 +155,6 @@ def _prefilter_coords_via_pyramid(
     pixel_means = thumb_arr.mean(axis=-1)
     tissue_map = (pixel_means >= 30.0) & (pixel_means <= 220.0)
 
-    # Etwas grosszuegigerer Schwellwert auf dem Thumbnail (0.50 statt 0.70), Level-0 prueft danach exakt >= 0.70
     low_thresh = max(0.45, min_tissue_fraction - 0.20)
     kept: list[tuple[int, int]] = []
     for x, y in coords:
@@ -179,7 +184,7 @@ def sample_patient(
     roi_saved = False
     roi_rows: list[dict[str, object]] = []
 
-    target_pool = int(max(tiles_per_patient * 1.2, tiles_per_patient + 10))
+    target_pool = tiles_per_patient
 
     for _, dcm_path, ts_uid, mpp_str in volumes:
         if len(candidates) >= target_pool:
@@ -189,12 +194,11 @@ def sample_patient(
             w_l0, h_l0 = slide.dimensions
             print(f"  [OpenSlide] {dcm_path.name} ({w_l0}x{h_l0} px, TS={ts_uid}, MPP={mpp_str})")
 
-            xs = range(0, max(1, w_l0 - 256), 256)
-            ys = range(0, max(1, h_l0 - 256), 256)
+            xs = range(0, max(1, w_l0 - 256 + 1), 256)
+            ys = range(0, max(1, h_l0 - 256 + 1), 256)
             coords = [(x, y) for y in ys for x in xs]
             rng.shuffle(coords)
 
-            # Schneller Pyramiden-Vorfilter verwirft weisses Glas in <0.1 Sekunden
             coords = _prefilter_coords_via_pyramid(
                 slide, dcm_path.parent, coords, w_l0, h_l0, min_tissue_fraction
             )
@@ -225,6 +229,12 @@ def sample_patient(
                 rx = min(max(0, cx - 896), w_l0 - 2048)
                 ry = min(max(0, cy - 896), h_l0 - 2048)
                 roi_rgb = slide.read_region((rx, ry), level=0, size=(2048, 2048)).convert("RGB")
+                roi_arr = np.asarray(roi_rgb, dtype=np.uint8)
+                roi_pm = roi_arr.mean(axis=-1)
+                roi_tm = (roi_pm >= 30.0) & (roi_pm <= 220.0)
+                roi_tf = float(np.mean(roi_tm))
+                roi_hr = ruifrok_he_ratio(roi_arr, roi_tm)
+
                 roi_id = f"{patient_id}_{sop_short}_x{rx}_y{ry}_s2048"
                 roi_rgb.save(roi_dir / f"{roi_id}.png", format="PNG")
                 roi_rows.append({
@@ -235,14 +245,14 @@ def sample_patient(
                     "sop_uid_short": sop_short,
                     "fold": fold,
                     "stain_stratum": "H&E_ROI_2048",
-                    "h_ratio": 0.5,
-                    "tissue_fraction": 1.0,
+                    "h_ratio": round(roi_hr, 4),
+                    "tissue_fraction": round(roi_tf, 3),
                     "mpp_um": mpp_str,
                     "tile_x": rx,
                     "tile_y": ry,
                     "tile_size": 2048,
                     "transfer_syntax": ts_uid,
-                    "is_fast_subset": True,
+                    "is_fast_subset": False,
                 })
                 roi_saved = True
 
@@ -255,14 +265,18 @@ def sample_patient(
     fast_s1 = fast_per_patient // 2
     fast_s2 = fast_per_patient - fast_s1
 
+    # Stratifizierte Zufallsauswahl innerhalb S1 und S2 (eliminiert Extremwert-vs.-Median-Bias!)
+    s1_fast_idx = set(rng.choice(half, size=min(fast_s1, half), replace=False).tolist()) if half > 0 else set()
+    n_s2 = len(selected) - half
+    s2_fast_idx = (
+        set((half + rng.choice(n_s2, size=min(fast_s2, n_s2), replace=False)).tolist()) if n_s2 > 0 else set()
+    )
+    fast_indices = s1_fast_idx | s2_fast_idx
+
     out_rows: list[dict[str, object]] = []
     for idx, (h_ratio, t_frac, x, y, sop_short, ts_uid, mpp_str, tile_arr) in enumerate(selected):
-        if idx < half:
-            stratum = "S1_eosinophilic"
-            is_fast = idx < fast_s1
-        else:
-            stratum = "S2_basophilic"
-            is_fast = (idx - half) < fast_s2
+        stratum = "S1_eosinophilic" if idx < half else "S2_basophilic"
+        is_fast = idx in fast_indices
 
         tile_id = f"{patient_id}_{sop_short}_x{x}_y{y}_s256"
         Image.fromarray(tile_arr).save(tiles_dir / f"{tile_id}.png", format="PNG")
@@ -307,7 +321,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    rng = np.random.default_rng(args.seed)
+    order_rng = np.random.default_rng(args.seed)
     args.tiles_dir.mkdir(parents=True, exist_ok=True)
     args.roi_dir.mkdir(parents=True, exist_ok=True)
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +343,6 @@ def main() -> None:
     try:
         completed = len(done_patients)
 
-        # 1. Lokalen Patienten in idc_rms_lossless zuerst verarbeiten
         if args.local_rms_dir.exists() and completed < args.num_patients:
             local_vols = get_verified_volumes(args.local_rms_dir)
             if local_vols:
@@ -341,7 +354,7 @@ def main() -> None:
                     rows = sample_patient(
                         pat0, ser0, (completed % 5) + 1, local_vols,
                         args.tiles_dir, args.roi_dir, args.tiles_per_patient,
-                        args.fast_per_patient, args.min_tissue, rng,
+                        args.fast_per_patient, args.min_tissue, _patient_rng(args.seed, pat0),
                     )
                     if rows:
                         writer.writerows(rows)
@@ -353,7 +366,6 @@ def main() -> None:
             print(f"\nZiel erreicht ({completed}/{args.num_patients} Patienten). Manifest: {args.manifest.resolve()}")
             return
 
-        # 2. Weitere Patienten deterministisch ueber idc-index streamen
         print("\n[IDC] Initialisiere IDCClient fuer weitere Patienten...")
         client = index.IDCClient()
         df = client.index
@@ -372,7 +384,7 @@ def main() -> None:
             rms_df = rms_df.sort_values(by=["PatientID"])
 
         patient_groups = list(rms_df.groupby("PatientID", sort=False))
-        perm = rng.permutation(len(patient_groups))
+        perm = order_rng.permutation(len(patient_groups))
         shuffled_patients = [patient_groups[i] for i in perm]
 
         for pat_id, grp in shuffled_patients:
@@ -406,7 +418,7 @@ def main() -> None:
                     rows = sample_patient(
                         pat_str, series_uid, fold, vols,
                         args.tiles_dir, args.roi_dir, args.tiles_per_patient,
-                        args.fast_per_patient, args.min_tissue, rng,
+                        args.fast_per_patient, args.min_tissue, _patient_rng(args.seed, pat_str),
                     )
                     if len([r for r in rows if r["track"] == "A"]) >= min(50, args.tiles_per_patient):
                         writer.writerows(rows)

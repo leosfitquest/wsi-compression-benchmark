@@ -1,9 +1,10 @@
 ﻿"""
 plot_rd_curves_curated.py
 -------------------------
-Plottet die Rate-Distortion-Kurven des Curated Test Sets v1 (Track A - IDC RMS):
-  1. rd_curves_track_a_curated.png: 3 Panels (RGB-PSNR, Y-PSNR, MS-SSIM)
-  2. rd_curves_track_a_s1_vs_s2.png: Stratifizierter Vergleich S1 (Pink) vs. S2 (Blau)
+Plottet die Rate-Distortion-Kurven des Curated Test Sets v1 (Track A - IDC RMS)
+strikt gepaart (Apples-to-Apples) auf exakt denselben 300 Kacheln (Schnittmenge mit results_rms_ai.csv):
+1. rd_curves_track_a_curated.png: 3 Panels (RGB-PSNR, Y-PSNR, MS-SSIM)
+2. rd_curves_track_a_s1_vs_s2.png: Stratifizierter Vergleich S1 (Pink) vs. S2 (Blau)
 """
 
 from __future__ import annotations
@@ -19,13 +20,20 @@ manifest_path = Path("results/curated_v1/manifest_track_a.csv")
 if not conv_path.exists():
     raise FileNotFoundError(f"Datei nicht gefunden: {conv_path}")
 
-df_conv = pd.read_csv(conv_path)
+df_conv_full = pd.read_csv(conv_path)
 df_ai = pd.read_csv(ai_path) if ai_path.exists() else pd.DataFrame()
 
+# Strikte 1:1-Paarung: Wenn CompressAI-Ergebnisse vorliegen, filtere df_conv auf exakt dieselben tile_ids
+if not df_ai.empty:
+    paired_ids = set(df_ai["tile_id"].astype(str).unique())
+    df_conv = df_conv_full[df_conv_full["tile_id"].astype(str).isin(paired_ids)].copy()
+else:
+    df_conv = df_conv_full.copy()
+
 styles = {
-    "AVIF":       {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif)"},
+    "AVIF":       {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif, 4:4:4)"},
     "JPEG XL":    {"color": "#2ca02c", "marker": "^", "label": "JPEG XL (libjxl)"},
-    "WebP":       {"color": "#17becf", "marker": "p", "label": "WebP (libwebp)"},
+    "WebP":       {"color": "#17becf", "marker": "p", "label": "WebP (libwebp, 4:2:0)"},
     "JPEG 2000":  {"color": "#1f77b4", "marker": "s", "label": "JPEG 2000 (OpenJPEG)"},
     "JPEG 4:4:4": {"color": "#7f7f7f", "marker": "o", "label": "JPEG 4:4:4"},
     "JPEG 4:2:0": {"color": "#bcbd22", "marker": "x", "label": "JPEG 4:2:0", "linestyle": ":"},
@@ -92,6 +100,7 @@ def _plot_three_panels(df_c: pd.DataFrame, df_a: pd.DataFrame, title: str, out_f
     plt.suptitle(title, fontsize=13.5, y=0.99)
     plt.tight_layout()
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.unlink(missing_ok=True)
     plt.savefig(out_file, dpi=300)
     plt.close(fig)
     print(f"Plot gespeichert: {out_file.resolve()}")
@@ -108,7 +117,7 @@ def _plot_s1_vs_s2(df_c: pd.DataFrame, df_a: pd.DataFrame, mf: pd.DataFrame, out
     ]
 
     for label_str, id_set, ax_psnr, ax_ssim in strata:
-        sub_c = df_c[df_c["tile_id"].isin(id_set)]
+        sub_c = df_c[df_c["tile_id"].astype(str).isin(id_set)]
         conv_grouped = (
             sub_c.groupby(["codec", "target_bpp"])
             .filter(lambda g: abs(g["bpp"].mean() - g["target_bpp"].iloc[0]) / g["target_bpp"].iloc[0] <= 0.15)
@@ -124,7 +133,7 @@ def _plot_s1_vs_s2(df_c: pd.DataFrame, df_a: pd.DataFrame, mf: pd.DataFrame, out
             ax_ssim.plot(group["bpp"], group["ms_ssim"], **st, linewidth=1.8)
 
         if not df_a.empty:
-            sub_a = df_a[df_a["tile_id"].isin(id_set)]
+            sub_a = df_a[df_a["tile_id"].astype(str).isin(id_set)]
             if not sub_a.empty:
                 ai_grouped = sub_a.groupby(["model", "quality"])[["bpp_real", "psnr_db", "ms_ssim"]].mean().reset_index()
                 for model, group in ai_grouped.groupby("model"):
@@ -144,8 +153,11 @@ def _plot_s1_vs_s2(df_c: pd.DataFrame, df_a: pd.DataFrame, mf: pd.DataFrame, out
         ax_ssim.set_title(f"{label_str} — MS-SSIM", fontsize=11.5, fontweight="bold")
         ax_ssim.set_ylabel("MS-SSIM", fontsize=10.5)
 
-    plt.suptitle("Ruifrok H&E Stain Stratification: S1 (Eosinophilic) vs. S2 (Basophilic)", fontsize=14, y=0.99)
+    n_paired = df_c["tile_id"].nunique()
+    plt.suptitle(f"Ruifrok H&E Stain Stratification: S1 vs. S2 (Paired n={n_paired} Tiles)", fontsize=14, y=0.99)
     plt.tight_layout()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.unlink(missing_ok=True)
     plt.savefig(out_file, dpi=300)
     plt.close(fig)
     print(f"Stratifizierter S1/S2-Plot gespeichert: {out_file.resolve()}")
@@ -156,7 +168,7 @@ if __name__ == "__main__":
     _plot_three_panels(
         df_conv,
         df_ai,
-        f"Curated Track A Benchmark (IDC RMS Lossless .90, n={n_tiles} Level-0 Tiles)",
+        f"Curated Track A Benchmark (IDC RMS Lossless .90 / .2.1, Paired n={n_tiles} Level-0 Tiles)",
         Path("results/curated_v1/rd_curves_track_a_curated.png"),
     )
     if manifest_path.exists():

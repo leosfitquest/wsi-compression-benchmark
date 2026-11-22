@@ -2,13 +2,13 @@
 prepare_track_b2_pannuke.py
 ---------------------------
 Bereitet Track B2 (PanNuke Fold 3, n=2.722 native 256x256 Tiles ueber 19 Organe) vor:
-  1. Laedt offizielles fold_3.zip von Warwick TIA herunter (falls noch nicht vorhanden).
-  2. Konvertiert images.npy (3.99 GB float64) verlustfrei in images_u8.npy (510.4 MB uint8)
-     und masks.npy (7.97 GB float64, 6 Kanaele) in masks_u16.npz (~40 MB uint16),
-     um ~11.4 GB SSD-Speicherplatz zu sparen.
-  3. Erstellt manifest_track_b2_pannuke.csv mit Zellkern-Anzahlen der 5 PanNuke-Klassen
-     (Neoplastic, Inflammatory, Connective, Dead, Epithelial), Forensik-Blockiness und
-     einem balancierten Fast-Subset (2 kernreichste Kacheln pro Organ = 38 Kacheln ueber alle 19 Organe).
+1. Laedt offizielles fold_3.zip von Warwick TIA herunter (falls noch nicht vorhanden).
+2. Konvertiert images.npy (3.99 GB float64) verlustfrei in images_u8.npy (510.4 MB uint8)
+   und masks.npy (7.97 GB float64, 6 Kanaele) mit kachelweisem ID-Remapping (1..K) in
+   masks_u16.npz (~40 MB uint16), damit Instanz-IDs >= 65.536 niemals still ueberlaufen!
+3. Erstellt manifest_track_b2_pannuke.csv mit Zellkern-Anzahlen der 5 PanNuke-Klassen
+   (Neoplastic, Inflammatory, Connective, Dead, Epithelial), Forensik-Blockiness und
+   einem balancierten Fast-Subset (2 kernreichste Kacheln pro Organ = 38 Kacheln ueber alle 19 Organe).
 """
 
 from __future__ import annotations
@@ -45,6 +45,21 @@ MANIFEST_B2_FIELDS = [
     "blockiness_8x8",
     "is_fast_subset",
 ]
+
+
+def _remap_tile_mask_to_u16(tile_mask_f64: np.ndarray) -> np.ndarray:
+    """Remappt PanNuke-Instanz-IDs (>= 65.536 moeglich) kachelweise sauber auf 1..K uint16 ohne Ueberlauf."""
+    rounded = np.rint(tile_mask_f64).astype(np.int64)
+    out = np.zeros(rounded.shape, dtype=np.uint16)
+    for c in range(rounded.shape[-1]):
+        ch = rounded[..., c]
+        pos_ids = np.unique(ch)
+        pos_ids = pos_ids[pos_ids > 0]
+        if pos_ids.size == 0:
+            continue
+        for new_id, old_id in enumerate(pos_ids, start=1):
+            out[..., c][ch == old_id] = new_id
+    return out
 
 
 def _download_with_progress(url: str, dest: Path) -> None:
@@ -85,7 +100,6 @@ def prepare_pannuke_fold3(
     masks_npz_path = data_dir / "masks_u16.npz"
     zip_path = data_dir / "fold_3.zip"
 
-    # 1. Falls images_u8.npy oder masks_u16.npz noch fehlen: aus lokalem Ordner oder fold_3.zip konvertieren
     if not (u8_img_path.exists() and types_path.exists() and masks_npz_path.exists()):
         raw_img = next(data_dir.rglob("images.npy"), None)
         raw_types = next(data_dir.rglob("types.npy"), None)
@@ -112,11 +126,11 @@ def prepare_pannuke_fold3(
                 if not masks_npz_path.exists():
                     tmp_msk = data_dir / "_tmp_masks_f64.npy"
                     _extract_member_by_suffix(zf, "masks.npy", tmp_msk)
-                    print("[Convert] Konvertiere masks.npy (float64 -> komprimiertes uint16 .npz)...")
+                    print("[Convert] Konvertiere masks.npy (float64 -> kachelweise remapped uint16 .npz)...")
                     arr_msk = np.load(tmp_msk, mmap_mode="r")
                     u16_msk = np.empty((len(arr_msk), 256, 256, 5), dtype=np.uint16)
                     for i in range(len(arr_msk)):
-                        u16_msk[i] = np.asarray(arr_msk[i, ..., :5], dtype=np.uint16)
+                        u16_msk[i] = _remap_tile_mask_to_u16(arr_msk[i, ..., :5])
                     np.savez_compressed(masks_npz_path, masks=u16_msk)
                     del arr_msk, u16_msk
                     tmp_msk.unlink(missing_ok=True)
@@ -132,20 +146,21 @@ def prepare_pannuke_fold3(
                 np.save(u8_img_path, u8_arr)
             if not masks_npz_path.exists():
                 arr_msk = np.load(raw_masks, mmap_mode="r")
-                u16_msk = np.asarray(arr_msk[..., :5], dtype=np.uint16)
+                u16_msk = np.empty((len(arr_msk), 256, 256, 5), dtype=np.uint16)
+                for i in range(len(arr_msk)):
+                    u16_msk[i] = _remap_tile_mask_to_u16(arr_msk[i, ..., :5])
                 np.savez_compressed(masks_npz_path, masks=u16_msk)
 
-    # 2. Manifest mit allen 2.722 Kacheln, 19 Organen und Zellkern-Statistiken aufbauen
     print("[Manifest] Analysiere 2.722 PanNuke Fold-3 Kacheln und 5-Klassen-Kernmasken...")
     images = np.load(u8_img_path, mmap_mode="r")
     organs = np.load(types_path, allow_pickle=True)
-    masks_5ch = np.load(masks_npz_path)["masks"]  # (2722, 256, 256, 5) uint16
+    masks_5ch = np.load(masks_npz_path)["masks"]
 
     rows: list[dict[str, object]] = []
     for idx in range(len(images)):
         tile = np.asarray(images[idx], dtype=np.uint8)
         organ = str(organs[idx]).strip().replace(" ", "_")
-        msk = masks_5ch[idx]  # (256, 256, 5)
+        msk = masks_5ch[idx]
 
         class_counts = []
         for c in range(5):
@@ -179,7 +194,6 @@ def prepare_pannuke_fold3(
             "is_fast_subset": False,
         })
 
-    # Pro Organ die `fast_per_organ` kernreichsten Kacheln als Fast-Subset markieren (19 x 2 = 38 Tiles)
     by_organ: dict[str, list[dict[str, object]]] = {}
     for r in rows:
         by_organ.setdefault(str(r["organ"]), []).append(r)

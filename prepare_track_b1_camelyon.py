@@ -2,13 +2,14 @@
 prepare_track_b1_camelyon.py
 ----------------------------
 100% Original-Daten-Pipeline fuer Track B1 (CAMELYON16 Lymph Node Metastasis):
-  - KEINE synthetischen Daten, KEINE Proxy-Kohorten.
-  - Fragt automatisch das offizielle AWS-S3-Bucket-Verzeichnis (camelyon-dataset)
-    sowie die GigaDB-100439-Mirrors (Wasabi S3 CDN & CNGB HTTP) ab, um die exakten
-    Pfade fuer `lesion_annotations.zip` / `tumor_*.xml` und `tumor_*.tif` / `normal_*.tif`
-    aufzuloesen.
-  - Extrahiert mit OpenSlide auf Level 0 exakt 256x256 Kacheln innerhalb der
-    verifizierten XML-Metastasen-Polygone (label=1) und aus Normal-Slides (label=0).
+- KEINE synthetischen Daten, KEINE Proxy-Kohorten.
+- Fragt automatisch das offizielle AWS-S3-Bucket-Verzeichnis (camelyon-dataset)
+  sowie die GigaDB-100439-Mirrors (Wasabi S3 CDN & CNGB HTTP) ab, um die exakten
+  Pfade fuer `lesion_annotations.zip` / `tumor_*.xml` und `tumor_*.tif` / `normal_*.tif`
+  aufzuloesen.
+- Beruecksichtigt CAMELYON16 Exclusion-Polygone (`PartOfGroup` in `Exclusion` / `_2`),
+  prueft Mindest-Tumor-Ueberlapp (`>= 30%`, Fischer-konform), prueft Slide-Randgrenzen
+  (`0 <= x0 <= w0 - 256`) und nutzt identische Gewebefilter fuer Tumor & Normal.
 """
 
 from __future__ import annotations
@@ -33,6 +34,11 @@ CNGB_GIGADB = "https://ftp.cngb.org/pub/gigadb/pub/10.5524/100001_101000/100439"
 
 DEFAULT_TUMOR_SLIDES = ("tumor_001", "tumor_002", "tumor_003", "tumor_004", "tumor_005")
 DEFAULT_NORMAL_SLIDES = ("normal_001", "normal_002", "normal_003", "normal_004", "normal_005")
+
+# Einheitliche Gewebeschwellen fuer Tumor & Normal (eliminiert Helligkeits-Confounder)
+TISSUE_MIN_INTENSITY = 25.0
+TISSUE_MAX_INTENSITY = 220.0
+MIN_TISSUE_FRACTION = 0.70
 
 MANIFEST_B1_FIELDS = [
     "tile_id",
@@ -105,7 +111,6 @@ def _ensure_xml_annotations(xml_dir: Path, required_slides: tuple[str, ...], s3_
     if all((xml_dir / f"{sid}.xml").exists() for sid in required_slides):
         return
 
-    # 1. Versuche zuerst das komplette lesion_annotations.zip (~10 MB) zu laden und zu entpacken
     s3_zip_urls = [
         f"{S3_BUCKET_ROOT}/{k}" for k in s3_keys
         if k.lower().endswith(".zip") and ("lesion" in k.lower() or "annot" in k.lower())
@@ -132,7 +137,6 @@ def _ensure_xml_annotations(xml_dir: Path, required_slides: tuple[str, ...], s3_
     except Exception:
         anno_zip.unlink(missing_ok=True)
 
-    # 2. Falls einzelne XMLs noch fehlen: Einzel-XML-Download ueber gefundene S3-Keys und Mirrors
     for sid in required_slides:
         target_xml = xml_dir / f"{sid}.xml"
         if target_xml.exists():
@@ -162,43 +166,66 @@ def _build_slide_urls(sid: str, is_tumor: bool, s3_keys: list[str]) -> list[str]
     ]
 
 
-def parse_camelyon_xml_polygons(xml_path: Path) -> list[list[tuple[float, float]]]:
+def parse_camelyon_xml_polygons(
+    xml_path: Path,
+) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
+    """Trennt Tumor-Polygone sauber von Exclusion-Polygonen (Normalgewebe-Loecher im Tumor)."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    polygons: list[list[tuple[float, float]]] = []
+    include_polys: list[list[tuple[float, float]]] = []
+    exclude_polys: list[list[tuple[float, float]]] = []
     for anno in root.findall(".//Annotation"):
-        coords = []
-        for coord in anno.findall(".//Coordinate"):
-            coords.append((float(coord.attrib["X"]), float(coord.attrib["Y"])))
+        group = str(anno.attrib.get("PartOfGroup", "")).strip().lower()
+        coords = [
+            (float(coord.attrib["X"]), float(coord.attrib["Y"]))
+            for coord in anno.findall(".//Coordinate")
+        ]
         if len(coords) >= 3:
-            polygons.append(coords)
-    return polygons
+            if "excl" in group or group == "_2":
+                exclude_polys.append(coords)
+            else:
+                include_polys.append(coords)
+    return include_polys, exclude_polys
 
 
 def build_lowres_tumor_mask(
-    slide: openslide.OpenSlide, polygons: list[list[tuple[float, float]]], downsample: int = 32
+    slide: openslide.OpenSlide,
+    include_polys: list[list[tuple[float, float]]],
+    exclude_polys: list[list[tuple[float, float]]],
+    downsample: int = 32,
 ) -> np.ndarray:
     w0, h0 = slide.dimensions
     wm, hm = max(1, w0 // downsample), max(1, h0 // downsample)
     mask_img = Image.new("L", (wm, hm), 0)
     draw = ImageDraw.Draw(mask_img)
-    for poly in polygons:
+    for poly in include_polys:
         scaled = [(x / downsample, y / downsample) for x, y in poly]
         draw.polygon(scaled, outline=1, fill=1)
+    for poly in exclude_polys:
+        scaled = [(x / downsample, y / downsample) for x, y in poly]
+        draw.polygon(scaled, outline=0, fill=0)
     return np.asarray(mask_img, dtype=np.uint8) > 0
 
 
 def extract_tumor_tiles_from_slide(
-    slide_path: Path, xml_path: Path, slide_id: str, max_tiles: int, seed: int = 42
+    slide_path: Path,
+    xml_path: Path,
+    slide_id: str,
+    max_tiles: int,
+    min_tumor_overlap: float = 0.30,
+    seed: int = 42,
 ) -> list[tuple[str, str, int, int, np.ndarray]]:
     slide = openslide.OpenSlide(str(slide_path))
-    polygons = parse_camelyon_xml_polygons(xml_path)
-    if not polygons:
+    w0, h0 = slide.dimensions
+    include_polys, exclude_polys = parse_camelyon_xml_polygons(xml_path)
+    if not include_polys:
         slide.close()
         raise ValueError(f"Keine Tumor-Polygone in {xml_path} gefunden!")
 
     ds = 32
-    tumor_mask = build_lowres_tumor_mask(slide, polygons, downsample=ds)
+    tile_ds = max(1, 256 // ds)  # 8x8 Pixel auf der 32x-Maske = exakt 256x256 auf Level 0
+    tumor_mask = build_lowres_tumor_mask(slide, include_polys, exclude_polys, downsample=ds)
+    hm, wm = tumor_mask.shape
     ys, xs = np.where(tumor_mask)
     if len(xs) == 0:
         slide.close()
@@ -214,13 +241,22 @@ def extract_tumor_tiles_from_slide(
             break
         x0 = int((xs[idx] * ds) // 256) * 256
         y0 = int((ys[idx] * ds) // 256) * 256
+        if x0 < 0 or y0 < 0 or x0 + 256 > w0 or y0 + 256 > h0:
+            continue
         if (x0, y0) in seen_coords:
             continue
         seen_coords.add((x0, y0))
 
+        # Pruefe echten Flaechen-Ueberlapp (>= 30% wie bei Fischer et al.)
+        mx0, my0 = x0 // ds, y0 // ds
+        mx1, my1 = min(wm, mx0 + tile_ds), min(hm, my0 + tile_ds)
+        sub_mask = tumor_mask[my0:my1, mx0:mx1]
+        if sub_mask.size == 0 or float(np.mean(sub_mask)) < min_tumor_overlap:
+            continue
+
         patch = np.asarray(slide.read_region((x0, y0), 0, (256, 256)).convert("RGB"), dtype=np.uint8)
         pm = patch.mean(axis=-1)
-        if float(np.mean((pm >= 25.0) & (pm <= 225.0))) < 0.70:
+        if float(np.mean((pm >= TISSUE_MIN_INTENSITY) & (pm <= TISSUE_MAX_INTENSITY))) < MIN_TISSUE_FRACTION:
             continue
         tid = f"cam16_{slide_id}_x{x0}_y{y0}"
         extracted.append((tid, slide_id, x0, y0, patch))
@@ -233,6 +269,7 @@ def extract_normal_tiles_from_slide(
     slide_path: Path, slide_id: str, max_tiles: int, seed: int = 42
 ) -> list[tuple[str, str, int, int, np.ndarray]]:
     slide = openslide.OpenSlide(str(slide_path))
+    w0, h0 = slide.dimensions
     best_level = min(slide.level_count - 1, 5)
     ds = float(slide.level_downsamples[best_level])
     thumb = np.asarray(slide.read_region((0, 0), best_level, slide.level_dimensions[best_level]).convert("RGB"))
@@ -249,13 +286,15 @@ def extract_normal_tiles_from_slide(
             break
         x0 = int((tissue_xs[idx] * ds) // 256) * 256
         y0 = int((tissue_ys[idx] * ds) // 256) * 256
+        if x0 < 0 or y0 < 0 or x0 + 256 > w0 or y0 + 256 > h0:
+            continue
         if (x0, y0) in seen_coords:
             continue
         seen_coords.add((x0, y0))
 
         patch = np.asarray(slide.read_region((x0, y0), 0, (256, 256)).convert("RGB"), dtype=np.uint8)
         pm = patch.mean(axis=-1)
-        if float(np.mean((pm >= 25.0) & (pm <= 220.0))) < 0.75:
+        if float(np.mean((pm >= TISSUE_MIN_INTENSITY) & (pm <= TISSUE_MAX_INTENSITY))) < MIN_TISSUE_FRACTION:
             continue
         tid = f"cam16_{slide_id}_x{x0}_y{y0}"
         extracted.append((tid, slide_id, x0, y0, patch))
@@ -270,6 +309,7 @@ def prepare_real_camelyon16(
     num_slides_per_class: int = 2,
     tiles_per_slide: int = 200,
     fast_per_class: int = 20,
+    min_tumor_overlap: float = 0.30,
     keep_wsi: bool = False,
 ) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -291,8 +331,10 @@ def prepare_real_camelyon16(
         tif_path = wsi_dir / f"{sid}.tif"
         if not tif_path.exists():
             _download_file(_build_slide_urls(sid, is_tumor=True, s3_keys=s3_keys), tif_path)
-        print(f"[Extraktion] Schneide {tiles_per_slide} echte Metastasen-Kacheln aus {sid}.tif (innerhalb XML-Polygon)...")
-        t_list = extract_tumor_tiles_from_slide(tif_path, xml_path, sid, max_tiles=tiles_per_slide)
+        print(f"[Extraktion] Schneide {tiles_per_slide} echte Metastasen-Kacheln aus {sid}.tif (Overlap >= {min_tumor_overlap:.0%})...")
+        t_list = extract_tumor_tiles_from_slide(
+            tif_path, xml_path, sid, max_tiles=tiles_per_slide, min_tumor_overlap=min_tumor_overlap
+        )
         tumor_tiles.extend(t_list)
         if not keep_wsi:
             tif_path.unlink(missing_ok=True)
@@ -318,7 +360,7 @@ def prepare_real_camelyon16(
     for i, (tid, sid, x0, y0, patch) in enumerate(tumor_tiles):
         u8_stack[idx] = patch
         pm = patch.mean(axis=-1)
-        h_rat = ruifrok_he_ratio(patch, (pm >= 25.0) & (pm <= 225.0))
+        h_rat = ruifrok_he_ratio(patch, (pm >= TISSUE_MIN_INTENSITY) & (pm <= TISSUE_MAX_INTENSITY))
         rows.append({
             "tile_id": tid,
             "tile_idx": idx,
@@ -337,7 +379,7 @@ def prepare_real_camelyon16(
     for i, (tid, sid, x0, y0, patch) in enumerate(normal_tiles):
         u8_stack[idx] = patch
         pm = patch.mean(axis=-1)
-        h_rat = ruifrok_he_ratio(patch, (pm >= 25.0) & (pm <= 225.0))
+        h_rat = ruifrok_he_ratio(patch, (pm >= TISSUE_MIN_INTENSITY) & (pm <= TISSUE_MAX_INTENSITY))
         rows.append({
             "tile_id": tid,
             "tile_idx": idx,
@@ -372,6 +414,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slides-per-class", type=int, default=2)
     p.add_argument("--tiles-per-slide", type=int, default=200)
     p.add_argument("--fast-per-class", type=int, default=20)
+    p.add_argument("--min-tumor-overlap", type=float, default=0.30)
     p.add_argument("--keep-wsi", action="store_true")
     return p.parse_args()
 
@@ -380,5 +423,5 @@ if __name__ == "__main__":
     args = parse_args()
     prepare_real_camelyon16(
         args.data_dir, args.manifest_out, args.slides_per_class,
-        args.tiles_per_slide, args.fast_per_class, args.keep_wsi,
+        args.tiles_per_slide, args.fast_per_class, args.min_tumor_overlap, args.keep_wsi,
     )

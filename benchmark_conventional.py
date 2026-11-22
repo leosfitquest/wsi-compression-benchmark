@@ -6,8 +6,8 @@ Rate-distortion benchmark of conventional codecs on RGB tiles.
     JPEG       Pillow (bundled libjpeg-turbo), chroma 4:4:4 and 4:2:0
     JPEG 2000  OpenJPEG CLI (opj_compress / opj_decompress); Pillow+OpenJPEG fallback
     JPEG XL    imagecodecs (libjxl) with fallback to libjxl CLI (cjxl / djxl)
-    WebP       Pillow (bundled libwebp)
-    AVIF       imagecodecs (libavif)
+    WebP       Pillow (bundled libwebp, YUV 4:2:0)
+    AVIF       imagecodecs (libavif, explicitly pinned YUV 4:4:4)
 
 For every tile, codec and target bit rate, the codec parameter (JPEG quality,
 J2K compression ratio, JXL distance) is bisected until the compressed file lands
@@ -254,11 +254,11 @@ class JpegXL(Codec):
 
 
 class CodecWebP(Codec):
-    """WebP Benchmark (Pillow integriertes libwebp)."""
+    """WebP Benchmark (Pillow integriertes libwebp, YUV 4:2:0)."""
 
     name = "WebP"
     param_name = "quality"
-    param_lo, param_hi = 1.0, 100.0
+    param_lo, param_hi = 0.0, 100.0
     integer_param = True
     rate_increases_with_param = True
 
@@ -283,7 +283,7 @@ class CodecWebP(Codec):
 
 
 class CodecAVIF(Codec):
-    """AVIF Implementation via imagecodecs (libavif)."""
+    """AVIF Implementation via imagecodecs (libavif) mit explizit gepinntem pixelformat (Default: YUV 4:4:4)."""
 
     name = "AVIF"
     param_name = "quality"
@@ -291,13 +291,18 @@ class CodecAVIF(Codec):
     integer_param = True
     rate_increases_with_param = True
 
-    def __init__(self, speed: int = 6) -> None:
+    def __init__(self, speed: int = 6, subsampling: str = "4:4:4") -> None:
         self.speed = speed
+        self.subsampling = subsampling
         self._ic = None
+        self._pixelformat = None
         try:
             import imagecodecs
             if hasattr(imagecodecs, "avif_encode") and hasattr(imagecodecs, "avif_decode"):
                 self._ic = imagecodecs
+                pf_enum = getattr(getattr(imagecodecs, "AVIF", None), "PIXEL_FORMAT", None)
+                enum_key = {"4:4:4": "YUV444", "4:2:2": "YUV422", "4:2:0": "YUV420"}.get(subsampling, "YUV444")
+                self._pixelformat = getattr(pf_enum, enum_key, subsampling.replace(":", ""))
         except ImportError:
             pass
 
@@ -309,13 +314,19 @@ class CodecAVIF(Codec):
             raise CodecUnavailableError("imagecodecs mit AVIF-Support ist nicht verfuegbar.")
 
         t0 = time.perf_counter()
-        encoded_bytes = self._ic.avif_encode(tile, level=int(param), speed=self.speed, numthreads=1)
+        encoded_bytes = self._ic.avif_encode(
+            tile,
+            level=int(param),
+            speed=self.speed,
+            pixelformat=self._pixelformat,
+            numthreads=1,
+        )
         t1 = time.perf_counter()
 
         decoded = self._ic.avif_decode(encoded_bytes, numthreads=1)
         t2 = time.perf_counter()
 
-        return Encoded(len(encoded_bytes), decoded, "imagecodecs/libavif", t1 - t0, t2 - t1)
+        return Encoded(len(encoded_bytes), decoded, f"imagecodecs/libavif ({self.subsampling})", t1 - t0, t2 - t1)
 
 
 # ---------------------------------------------------------------------------

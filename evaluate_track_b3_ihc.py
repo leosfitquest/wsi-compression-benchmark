@@ -2,14 +2,15 @@
 evaluate_track_b3_ihc.py
 ------------------------
 Fuehrt den Track-B3-Benchmark (IHC / DAB Color & Chroma-Subsampling Stress Test) durch:
-  - Vergleicht 4:4:4 (JPEG 4:4:4, JPEG 2000), 4:2:0 (JPEG 4:2:0, WebP, AVIF),
-    XYB-Farbraum (JPEG XL) und neuronale RGB-Autoencoder (Hyperprior, Cheng2020)
-  - Berechnet pro Kachel und Bitrate:
-      * RGB-PSNR, Luminanz Y-PSNR und Chrominanz CbCr-PSNR (ITU-R BT.601)
-      * Ruifrok (2001) DAB-Stain-PSNR (Genauigkeit der braunen DAB-Optischen-Dichte)
-      * DAB-Positivity-Dice (Stabilitaet der IHC-positiven Gewebemaske)
-      * Perzeptueller Farbabstand CIE Delta-E (Delta E*ab im L*a*b*-Farbraum)
-  - Erzeugt Summary-CSV, BD-Rate-Chroma-Ablationstabelle und rd_curves_track_b3_ihc.png.
+- Vergleicht 4:4:4 (JPEG 4:4:4, JPEG 2000, AVIF 4:4:4), 4:2:0 (JPEG 4:2:0, WebP),
+  XYB-Farbraum (JPEG XL) und neuronale RGB-Autoencoder (Hyperprior, Cheng2020)
+- Berechnet pro Kachel und Bitrate:
+  - RGB-PSNR, Luminanz Y-PSNR und Chrominanz CbCr-PSNR (ITU-R BT.601)
+  - Ruifrok (2001) DAB-Stain-PSNR (ungesaettigte physikalische DAB-OD ohne Clipping bei OD=2.125)
+  - DAB-Positivity-Dice (feste physikalische Schwelle DAB OD >= 0.15)
+  - Perzeptueller Farbabstand CIE Delta-E (Delta E*ab im L*a*b*-Farbraum)
+- Erzeugt Summary-CSV, ungerundete PCHIP-BD-Rate-Chroma-Ablationstabelle und rd_curves_track_b3_ihc.png.
+- Unterstuetzt `--recompute-from-csv` fuer 1-Sekunden-PCHIP-Reaggregation ohne neuen Codec-Lauf.
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ from benchmark_conventional import (
 from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_y
 from prepare_track_b3_anhir_ihc import _INV_HDAB_MAT
 
+# Exakte physikalische Obergrenze der Ruifrok-DAB-OD bei uint8 >= 1: log10(255) / 0.776 ~= 3.1012 OD
+DAB_PEAK_OD = float(math.log10(255.0) / 0.776)
+
 
 @dataclass(frozen=True)
 class B3ResultRow:
@@ -70,7 +74,7 @@ CHROMA_MODES = {
     "JPEG 2000": "4:4:4 (ICT Wavelet)",
     "JPEG XL": "XYB (Opsin Perceptual)",
     "WebP": "4:2:0 (YUV420p)",
-    "AVIF": "YUV (AV1 Intra)",
+    "AVIF": "4:4:4 (AV1 Intra)",
     "bmshj2018-hyperprior": "Neural RGB Latent",
     "cheng2020-attn": "Neural RGB Attention",
 }
@@ -86,28 +90,30 @@ def psnr_cbcr(ref: np.ndarray, rec: np.ndarray) -> float:
     cr2 = 0.500000 * r2 - 0.418688 * g2 - 0.081312 * b2
     mse = 0.5 * float(np.mean((cb1 - cb2) ** 2) + np.mean((cr1 - cr2) ** 2))
     if mse == 0.0:
-        return 99.0
+        return float("nan")
     return float(10.0 * math.log10(255.0**2 / mse))
 
 
-def extract_dab_scaled(tile: np.ndarray) -> np.ndarray:
-    """Extrahiert die Ruifrok (2001) DAB-Optische-Dichte-Konzentration normiert auf [0, 255]."""
+def extract_dab_od(tile: np.ndarray) -> np.ndarray:
+    """Extrahiert die ungesaettigte Ruifrok (2001) DAB-Optische-Dichte ohne Clipping starker DAB-Pixel."""
     od = -np.log10(np.clip(tile.astype(np.float64), 1.0, 255.0) / 255.0)
-    dab_od = np.maximum((od @ _INV_HDAB_MAT)[..., 1], 0.0)
-    return np.clip(dab_od * 120.0, 0.0, 255.0)
+    return np.maximum((od @ _INV_HDAB_MAT)[..., 1], 0.0)
 
 
 def dab_psnr_and_dice(dab_ref: np.ndarray, rec: np.ndarray) -> tuple[float, float]:
-    dab_rec = extract_dab_scaled(rec)
+    dab_rec = extract_dab_od(rec)
     mse = float(np.mean((dab_ref - dab_rec) ** 2))
-    psnr_val = 99.0 if mse == 0.0 else float(10.0 * math.log10(255.0**2 / mse))
+    if mse == 0.0:
+        psnr_val = float("nan")
+    else:
+        psnr_val = float(10.0 * math.log10(DAB_PEAK_OD**2 / mse))
 
-    thresh = max(18.0, float(np.percentile(dab_ref, 75.0)))
-    m_ref = dab_ref >= thresh
-    m_rec = dab_rec >= thresh
+    # Feste physikalische Positivitaetsschwelle (OD >= 0.15, konsistent mit prepare_track_b3_anhir_ihc.py)
+    m_ref = dab_ref >= 0.15
+    m_rec = dab_rec >= 0.15
     inter = float(np.logical_and(m_ref, m_rec).sum())
     tot = float(m_ref.sum() + m_rec.sum())
-    dice_val = (2.0 * inter / tot) if tot > 0.0 else 1.0
+    dice_val = (2.0 * inter / tot) if tot > 0.0 else float("nan")
     return psnr_val, dice_val
 
 
@@ -134,6 +140,106 @@ def cie_delta_e(lab_ref: np.ndarray, rec: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(lab_ref - lab_rec, axis=-1)))
 
 
+def _aggregate_and_save_b3(
+    df: pd.DataFrame,
+    summary_csv: Path,
+    bdrate_csv: Path,
+    plot_path: Path,
+) -> None:
+    df = df.copy()
+    df["chroma_mode"] = df["codec_or_model"].map(lambda x: CHROMA_MODES.get(str(x), "Other"))
+
+    df_valid = df.groupby(["codec_or_model", "target_bpp"]).filter(
+        lambda g: (g["category"].iloc[0] == "neural")
+        or (abs(g["bpp"].mean() - g["target_bpp"].iloc[0]) / g["target_bpp"].iloc[0] <= 0.15)
+    )
+
+    bucket_key = df_valid["target_bpp"].where(df_valid["category"] == "conventional", df_valid["setting"])
+
+    raw_summary_rows = []
+    rounded_summary_rows = []
+    for (name, bucket), grp in df_valid.groupby(["codec_or_model", bucket_key]):
+        mean_bpp = float(grp["bpp"].mean())
+        mean_rgb = float(grp["psnr_rgb_db"].mean())
+        mean_y = float(grp["psnr_y_db"].mean())
+        mean_chr = float(grp["psnr_chroma_db"].mean())
+        mean_dab = float(grp["psnr_dab_db"].mean())
+        mean_dice = float(grp["dab_dice"].mean())
+        mean_de = float(grp["cie_delta_e"].mean())
+
+        raw_summary_rows.append({
+            "Codec / Model": str(name),
+            "Chroma Mode": CHROMA_MODES.get(str(name), "Other"),
+            "Bucket": float(bucket),
+            "Mean bpp": mean_bpp,
+            "RGB-PSNR [dB]": mean_rgb,
+            "Y-PSNR [dB]": mean_y,
+            "Chroma-PSNR [dB]": mean_chr,
+            "DAB-Stain-PSNR [dB]": mean_dab,
+            "DAB-Dice": mean_dice,
+            "CIE Delta-E": mean_de,
+        })
+        rounded_summary_rows.append({
+            "Codec / Model": str(name),
+            "Chroma Mode": CHROMA_MODES.get(str(name), "Other"),
+            "Bucket": float(bucket),
+            "Mean bpp": round(mean_bpp, 3),
+            "RGB-PSNR [dB]": round(mean_rgb, 2),
+            "Y-PSNR [dB]": round(mean_y, 2),
+            "Chroma-PSNR [dB]": round(mean_chr, 2),
+            "DAB-Stain-PSNR [dB]": round(mean_dab, 2),
+            "DAB-Dice": round(mean_dice, 4),
+            "CIE Delta-E": round(mean_de, 2),
+        })
+
+    raw_sum_df = pd.DataFrame(raw_summary_rows).sort_values(["Codec / Model", "Mean bpp"])
+    sum_df = pd.DataFrame(rounded_summary_rows).sort_values(["Codec / Model", "Mean bpp"])
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    sum_df.to_csv(summary_csv, index=False)
+
+    # PCHIP BD-Rate Chroma-Ablation direkt auf den UNGERUNDETEN Gruppenmitteln (relativ zu JPEG 4:4:4)
+    anchor = "JPEG 4:4:4"
+    ref_grp = raw_sum_df[raw_sum_df["Codec / Model"] == anchor].sort_values("Mean bpp")
+    ref_grp = ref_grp.loc[ref_grp["Mean bpp"].round(3).drop_duplicates(keep="last").index]
+    r_ref = ref_grp["Mean bpp"].to_numpy()
+    prgb_ref = ref_grp["RGB-PSNR [dB]"].to_numpy()
+    py_ref = ref_grp["Y-PSNR [dB]"].to_numpy()
+    pchr_ref = ref_grp["Chroma-PSNR [dB]"].to_numpy()
+    pdab_ref = ref_grp["DAB-Stain-PSNR [dB]"].to_numpy()
+
+    bdr_rows = []
+    for name, grp in raw_sum_df.groupby("Codec / Model"):
+        grp = grp.sort_values("Mean bpp")
+        grp = grp.loc[grp["Mean bpp"].round(3).drop_duplicates(keep="last").index]
+        r_t = grp["Mean bpp"].to_numpy()
+        if name == anchor:
+            bdr_rgb, bdr_y, bdr_chr, bdr_dab, bdp_dab = 0.0, 0.0, 0.0, 0.0, 0.0
+        else:
+            bdr_rgb = bd_rate(r_ref, prgb_ref, r_t, grp["RGB-PSNR [dB]"].to_numpy())
+            bdr_y = bd_rate(r_ref, py_ref, r_t, grp["Y-PSNR [dB]"].to_numpy())
+            bdr_chr = bd_rate(r_ref, pchr_ref, r_t, grp["Chroma-PSNR [dB]"].to_numpy())
+            bdr_dab = bd_rate(r_ref, pdab_ref, r_t, grp["DAB-Stain-PSNR [dB]"].to_numpy())
+            bdp_dab = bd_psnr(r_ref, pdab_ref, r_t, grp["DAB-Stain-PSNR [dB]"].to_numpy())
+        bdr_rows.append({
+            "Codec / Model": str(name),
+            "Chroma Mode": CHROMA_MODES.get(str(name), "Other"),
+            "BD-Rate RGB-PSNR [%]": round(bdr_rgb, 2),
+            "BD-Rate Y-PSNR [%]": round(bdr_y, 2),
+            "BD-Rate Chroma-PSNR [%]": round(bdr_chr, 2),
+            "BD-Rate DAB-Stain-PSNR [%]": round(bdr_dab, 2),
+            "BD-DAB-PSNR [dB]": round(bdp_dab, 2),
+        })
+
+    bdr_df = pd.DataFrame(bdr_rows).sort_values("BD-Rate DAB-Stain-PSNR [%]")
+    bdr_df.to_csv(bdrate_csv, index=False)
+    print(f"\n=== Track B3: IHC / DAB Chroma-Subsampling Ablation (Anchor: {anchor}, Method: PCHIP) ===")
+    print(bdr_df.to_string(index=False))
+    print(f"Saved to: {bdrate_csv.resolve()}")
+
+    n_tiles = int(df["tile_id"].nunique())
+    _plot_track_b3(sum_df, n_tiles, plot_path)
+
+
 def run_track_b3(
     data_dir: Path,
     manifest_path: Path,
@@ -143,7 +249,17 @@ def run_track_b3(
     plot_path: Path,
     fast_only: bool = True,
     limit: int | None = None,
+    recompute_from_csv: bool = False,
 ) -> None:
+    if recompute_from_csv:
+        if not out_csv.exists():
+            raise FileNotFoundError(f"Raw-CSV nicht gefunden: {out_csv}")
+        df = pd.read_csv(out_csv)
+        df["chroma_mode"] = df["codec_or_model"].map(lambda x: CHROMA_MODES.get(str(x), "Other"))
+        df.to_csv(out_csv, index=False)
+        _aggregate_and_save_b3(df, summary_csv, bdrate_csv, plot_path)
+        return
+
     npy_path = data_dir / "ihc_tiles_u8.npy"
     if not npy_path.exists() or not manifest_path.exists():
         raise FileNotFoundError("Bitte zuerst `python prepare_track_b3_anhir_ihc.py` ausfuehren.")
@@ -164,7 +280,7 @@ def run_track_b3(
         idx = int(r["tile_idx"])
         prof = str(r["subset_or_profile"])
         tile = np.asarray(images[idx], dtype=np.uint8).copy()
-        dab_ref = extract_dab_scaled(tile)
+        dab_ref = extract_dab_od(tile)
         lab_ref = _rgb_to_lab(tile)
         ref_cache[tid] = (prof, tile, dab_ref, lab_ref)
 
@@ -196,8 +312,8 @@ def run_track_b3(
             psnr_rgb_db=round(psnr_rgb(ref_tile, decoded), 2),
             psnr_y_db=round(psnr_y(ref_tile, decoded), 2),
             psnr_chroma_db=round(psnr_cbcr(ref_tile, decoded), 2),
-            psnr_dab_db=round(p_dab, 2),
-            dab_dice=round(d_dice, 4),
+            psnr_dab_db=round(p_dab, 2) if np.isfinite(p_dab) else float("nan"),
+            dab_dice=round(d_dice, 4) if np.isfinite(d_dice) else float("nan"),
             cie_delta_e=round(de_val, 3),
             ms_ssim=round(ms_ssim_rgb(ref_tile, decoded), 4),
         )
@@ -237,75 +353,12 @@ def run_track_b3(
         writer.writerows(asdict(r) for r in rows)
 
     df = pd.DataFrame([asdict(r) for r in rows])
-    df_valid = df.groupby(["codec_or_model", "target_bpp"]).filter(
-        lambda g: (g["category"].iloc[0] == "neural")
-        or (abs(g["bpp"].mean() - g["target_bpp"].iloc[0]) / g["target_bpp"].iloc[0] <= 0.15)
-    )
-
-    summary_list = []
-    for (name, bucket), grp in df_valid.groupby(
-        ["codec_or_model", df_valid["target_bpp"].where(df_valid["category"] == "conventional", df_valid["setting"])]
-    ):
-        summary_list.append({
-            "Codec / Model": name,
-            "Chroma Mode": CHROMA_MODES.get(str(name), "Other"),
-            "Bucket": bucket,
-            "Mean bpp": round(float(grp["bpp"].mean()), 3),
-            "RGB-PSNR [dB]": round(float(grp["psnr_rgb_db"].mean()), 2),
-            "Y-PSNR [dB]": round(float(grp["psnr_y_db"].mean()), 2),
-            "Chroma-PSNR [dB]": round(float(grp["psnr_chroma_db"].mean()), 2),
-            "DAB-Stain-PSNR [dB]": round(float(grp["psnr_dab_db"].mean()), 2),
-            "DAB-Dice": round(float(grp["dab_dice"].mean()), 4),
-            "CIE Delta-E": round(float(grp["cie_delta_e"].mean()), 2),
-        })
-
-    sum_df = pd.DataFrame(summary_list).sort_values(["Codec / Model", "Mean bpp"])
-    sum_df.to_csv(summary_csv, index=False)
-
-    # BD-Rate Chroma-Ablation relativ zu JPEG 4:4:4
-    anchor = "JPEG 4:4:4"
-    ref_grp = sum_df[sum_df["Codec / Model"] == anchor].sort_values("Mean bpp")
-    r_ref = ref_grp["Mean bpp"].to_numpy()
-    prgb_ref = ref_grp["RGB-PSNR [dB]"].to_numpy()
-    py_ref = ref_grp["Y-PSNR [dB]"].to_numpy()
-    pchr_ref = ref_grp["Chroma-PSNR [dB]"].to_numpy()
-    pdab_ref = ref_grp["DAB-Stain-PSNR [dB]"].to_numpy()
-
-    bdr_rows = []
-    for name, grp in sum_df.groupby("Codec / Model"):
-        grp = grp.sort_values("Mean bpp")
-        grp = grp.loc[grp["Mean bpp"].round(3).drop_duplicates(keep="last").index]
-        r_t = grp["Mean bpp"].to_numpy()
-        if name == anchor:
-            bdr_rgb, bdr_y, bdr_chr, bdr_dab, bdp_dab = 0.0, 0.0, 0.0, 0.0, 0.0
-        else:
-            bdr_rgb = bd_rate(r_ref, prgb_ref, r_t, grp["RGB-PSNR [dB]"].to_numpy())
-            bdr_y = bd_rate(r_ref, py_ref, r_t, grp["Y-PSNR [dB]"].to_numpy())
-            bdr_chr = bd_rate(r_ref, pchr_ref, r_t, grp["Chroma-PSNR [dB]"].to_numpy())
-            bdr_dab = bd_rate(r_ref, pdab_ref, r_t, grp["DAB-Stain-PSNR [dB]"].to_numpy())
-            bdp_dab = bd_psnr(r_ref, pdab_ref, r_t, grp["DAB-Stain-PSNR [dB]"].to_numpy())
-        bdr_rows.append({
-            "Codec / Model": name,
-            "Chroma Mode": CHROMA_MODES.get(str(name), "Other"),
-            "BD-Rate RGB-PSNR [%]": round(bdr_rgb, 2),
-            "BD-Rate Y-PSNR [%]": round(bdr_y, 2),
-            "BD-Rate Chroma-PSNR [%]": round(bdr_chr, 2),
-            "BD-Rate DAB-Stain-PSNR [%]": round(bdr_dab, 2),
-            "BD-DAB-PSNR [dB]": round(bdp_dab, 2),
-        })
-
-    bdr_df = pd.DataFrame(bdr_rows).sort_values("BD-Rate DAB-Stain-PSNR [%]")
-    bdr_df.to_csv(bdrate_csv, index=False)
-    print(f"\n=== Track B3: IHC / DAB Chroma-Subsampling Ablation (Anchor: {anchor}) ===")
-    print(bdr_df.to_string(index=False))
-    print(f"Saved to: {bdrate_csv.resolve()}")
-
-    _plot_track_b3(sum_df, len(ref_cache), plot_path)
+    _aggregate_and_save_b3(df, summary_csv, bdrate_csv, plot_path)
 
 
 def _plot_track_b3(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
     styles = {
-        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif)", "linestyle": "-"},
+        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif, 4:4:4)", "linestyle": "-"},
         "JPEG XL":              {"color": "#2ca02c", "marker": "^", "label": "JPEG XL (XYB space)", "linestyle": "-"},
         "WebP":                 {"color": "#17becf", "marker": "p", "label": "WebP (4:2:0)", "linestyle": "-"},
         "JPEG 2000":            {"color": "#1f77b4", "marker": "s", "label": "JPEG 2000 (4:4:4 ICT)", "linestyle": "-"},
@@ -343,6 +396,7 @@ def _plot_track_b3(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
     plt.suptitle(f"Curated Track B3: IHC / DAB Color & Chroma-Subsampling Stress Test (n={n_tiles} Lossless Tiles)", fontsize=13.5, y=0.99)
     plt.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_path.unlink(missing_ok=True)
     plt.savefig(plot_path, dpi=300)
     plt.close(fig)
     print(f"Track-B3-Plot gespeichert: {plot_path.resolve()}")
@@ -358,6 +412,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot", type=Path, default=Path("results/curated_v1/rd_curves_track_b3_ihc.png"))
     p.add_argument("--all-tiles", action="store_true", help="Run all 2,000 tiles instead of the 40-tile fast subset")
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--recompute-from-csv", action="store_true", help="Re-aggregate summary, PCHIP BD-Rate & plot from existing raw CSV")
     return p.parse_args()
 
 
@@ -366,4 +421,5 @@ if __name__ == "__main__":
     run_track_b3(
         args.data_dir, args.manifest, args.out, args.summary, args.bdrate, args.plot,
         fast_only=not args.all_tiles, limit=args.limit,
+        recompute_from_csv=args.recompute_from_csv,
     )

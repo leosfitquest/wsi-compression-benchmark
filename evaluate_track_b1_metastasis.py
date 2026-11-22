@@ -4,8 +4,11 @@ evaluate_track_b1_metastasis.py
 Fuehrt den Track-B1-Benchmark (CAMELYON16 Metastasis Classification & Deep Feature Drift) durch:
   - 6 konventionelle Codecs (JPEG 4:4:4, JPEG 4:2:0, JPEG 2000, JPEG XL, WebP, AVIF)
   - 2 CompressAI-Modelle (bmshj2018-hyperprior, cheng2020-attn)
-  - Kalibriert einen eingefrorenen Linear-Probe-Klassifikator (ResNet-50 2048-D Features
-    + Ruifrok Haematoxylin-OD-Merkmale) auf den unkomprimierten Referenz-Kacheln und misst:
+  - Trainiert den Linear-Probe-Klassifikator STRIKT OUT-OF-SAMPLE auf den nicht im
+    Test-Subset enthaltenen CAMELYON16-Kacheln (N_train = 368 balancierte Kacheln, ~is_fast_subset)
+    mit dimensionsreduziertem, gegen 8x8-Scanner-Gitter robustem Histologie-Deskriptor
+    (8 Ruifrok-Haematoxylin/Morphologie-Merkmale + Top-6-PCA-Komponenten von ResNet-50 = 15 Parameter,
+    N_train >> d) und evaluiere out-of-sample auf den N_test = 40 Fast-Subset-Kacheln:
       * Classification AUROC und Delta-AUROC vs. Reference
       * Tumor Probability Drift |P_dec(tumor) - P_ref(tumor)| (niedriger = stabiler)
       * Classification Decision Agreement [%]
@@ -80,34 +83,78 @@ def compute_auroc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return wins / float(n_pos * n_neg)
 
 
-def _extract_combined_descriptor(tile: np.ndarray, feat_vec: torch.Tensor) -> np.ndarray:
+def _extract_stain_morph_features(tile: np.ndarray) -> np.ndarray:
+    """Extrahiert 8 physikalische Ruifrok H&E-Chromatin- & Gewebe-Merkmale."""
     od = -np.log10(np.clip(tile.astype(np.float64), 1.0, 255.0) / 255.0)
     stains = od @ _INV_STAIN_MAT
     h_ch = np.maximum(stains[..., 0], 0.0)
     e_ch = np.maximum(stains[..., 1], 0.0)
 
     h_mean = float(np.mean(h_ch))
-    h_p90 = float(np.percentile(h_ch, 90.0))
     h_std = float(np.std(h_ch))
+    h_p75 = float(np.percentile(h_ch, 75.0))
+    h_p90 = float(np.percentile(h_ch, 90.0))
     e_mean = float(np.mean(e_ch))
+    e_std = float(np.std(e_ch))
     he_ratio = h_mean / (h_mean + e_mean + 1e-8)
-
-    morph_vec = np.array([h_mean, h_p90, h_std, e_mean, he_ratio, 1.0], dtype=np.float64)
-    cnn_np = feat_vec.squeeze(0).cpu().numpy().astype(np.float64)
-    return np.concatenate([cnn_np, morph_vec], axis=0)
+    nuc_frac = float(np.mean(h_ch >= 0.22))
+    return np.array([h_mean, h_std, h_p75, h_p90, e_mean, e_std, he_ratio, nuc_frac], dtype=np.float64)
 
 
-def _fit_linear_probe(X: np.ndarray, y: np.ndarray, l2_reg: float = 2.0) -> np.ndarray:
-    targets = np.where(y == 1, 2.2, -2.2).astype(np.float64)
-    d = X.shape[1]
-    reg_mat = l2_reg * np.eye(d, dtype=np.float64)
-    reg_mat[-1, -1] = 1e-4
-    return np.linalg.solve(X.T @ X + reg_mat, X.T @ targets)
+class OutOfSampleMetastasisProbe:
+    """
+    Kompakter Out-of-Sample Linear Probe (d = 15 Parameter, trainiert auf N_train = 368 Kacheln):
+    Verhindert das Memorieren des 8x8-Scanner-JPEG-Gitters durch:
+      1. Z-Score-Standardisierung auf dem unabhaengigen Trainings-Split (~is_fast_subset)
+      2. Top-6 PCA-Projektion der 2048-D ResNet-50-Embeddings (verwirft 2042 hochfrequente Gitter-Rauschdimensionen)
+      3. Kombination mit den 8 Ruifrok-Haematoxylin/Eosin-Morphologie-Merkmalen
+    """
 
+    def __init__(self, n_pca: int = 6, l2_reg: float = 15.0) -> None:
+        self.n_pca = n_pca
+        self.l2_reg = l2_reg
+        self.cnn_mean: np.ndarray | None = None
+        self.pca_components: np.ndarray | None = None
+        self.feat_mean: np.ndarray | None = None
+        self.feat_std: np.ndarray | None = None
+        self.w: np.ndarray | None = None
 
-def _predict_prob(desc: np.ndarray, w: np.ndarray) -> float:
-    logit = max(-20.0, min(20.0, float(np.dot(desc, w))))
-    return 1.0 / (1.0 + float(np.exp(-logit)))
+    def fit(self, cnn_mat: np.ndarray, morph_mat: np.ndarray, y: np.ndarray) -> None:
+        self.cnn_mean = np.mean(cnn_mat, axis=0, keepdims=True)
+        centered = cnn_mat - self.cnn_mean
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        k = min(self.n_pca, vt.shape[0])
+        self.pca_components = vt[:k].T  # (2048, k)
+
+        cnn_pca = centered @ self.pca_components
+        raw_x = np.concatenate([morph_mat, cnn_pca], axis=1)
+        self.feat_mean = np.mean(raw_x, axis=0, keepdims=True)
+        self.feat_std = np.std(raw_x, axis=0, keepdims=True) + 1e-6
+
+        x_norm = (raw_x - self.feat_mean) / self.feat_std
+        x_aug = np.concatenate([x_norm, np.ones((x_norm.shape[0], 1), dtype=np.float64)], axis=1)
+
+        pos_weight = float(np.sum(y == 0)) / max(1.0, float(np.sum(y == 1)))
+        sample_w = np.where(y == 1, pos_weight, 1.0).astype(np.float64)
+        targets = np.where(y == 1, 2.0, -2.0).astype(np.float64)
+
+        d = x_aug.shape[1]
+        reg_mat = self.l2_reg * np.eye(d, dtype=np.float64)
+        reg_mat[-1, -1] = 1e-4
+        wx = x_aug * sample_w[:, None]
+        self.w = np.linalg.solve(wx.T @ x_aug + reg_mat, wx.T @ targets)
+
+    def predict_prob(self, tile: np.ndarray, feat_vec: torch.Tensor) -> float:
+        assert self.cnn_mean is not None and self.pca_components is not None
+        assert self.feat_mean is not None and self.feat_std is not None and self.w is not None
+        morph = _extract_stain_morph_features(tile)[None, :]
+        cnn_np = feat_vec.squeeze(0).cpu().numpy().astype(np.float64)[None, :]
+        cnn_pca = (cnn_np - self.cnn_mean) @ self.pca_components
+        raw_x = np.concatenate([morph, cnn_pca], axis=1)
+        x_norm = (raw_x - self.feat_mean) / self.feat_std
+        x_aug = np.concatenate([x_norm, np.ones((1, 1), dtype=np.float64)], axis=1)
+        logit = max(-20.0, min(20.0, float((x_aug @ self.w).item())))
+        return 1.0 / (1.0 + float(np.exp(-logit)))
 
 
 def run_track_b1(
@@ -124,41 +171,68 @@ def run_track_b1(
         raise FileNotFoundError("Bitte zuerst `python prepare_track_b1_camelyon.py` ausfuehren.")
 
     images = np.load(npy_path, mmap_mode="r")
-    mf = pd.read_csv(manifest_path)
-    if fast_only:
-        mf = mf[mf["is_fast_subset"].astype(str).str.lower() == "true"].copy()
+    full_mf = pd.read_csv(manifest_path)
+
+    is_fast_mask = full_mf["is_fast_subset"].astype(str).str.lower() == "true"
+    train_mf = full_mf[~is_fast_mask].copy()
+    eval_mf = full_mf[is_fast_mask].copy() if fast_only else full_mf.copy()
     if limit is not None:
-        mf = mf.head(limit).copy()
+        eval_mf = eval_mf.head(limit).copy()
+
+    pos_train = train_mf[train_mf["label"] == 1]
+    neg_train = train_mf[train_mf["label"] == 0]
+    n_pos_tr = len(pos_train)
+    if n_pos_tr > 0 and len(neg_train) > 0:
+        neg_sampled = neg_train.sample(n=min(len(neg_train), n_pos_tr), random_state=42)
+        train_bal_mf = pd.concat([pos_train, neg_sampled], ignore_index=True)
+    else:
+        train_bal_mf = full_mf.copy()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Track B1] Starte CAMELYON16 Metastasis & Feature Drift auf {len(mf)} Kacheln (Device={device})...")
+    print(
+        f"[Track B1] Kalibriere Out-of-Sample-Klassifikator auf {len(train_bal_mf)} Trainings-Kacheln "
+        f"(d=15 Parameter) und evaluiere auf {len(eval_mf)} Test-Kacheln (Device={device})..."
+    )
     feat_extractor = DeepFeatureExtractor(device)
     codecs = build_codecs(jxl_effort=7, verbose=False)
 
-    ref_items: list[tuple[str, int, str, np.ndarray, torch.Tensor, np.ndarray]] = []
-    for _, r in mf.iterrows():
+    tr_cnn_list: list[np.ndarray] = []
+    tr_morph_list: list[np.ndarray] = []
+    tr_y_list: list[int] = []
+    for _, r in train_bal_mf.iterrows():
+        idx = int(r["tile_idx"])
+        tile = np.asarray(images[idx], dtype=np.uint8).copy()
+        f_tr = feat_extractor.embed(tile)
+        tr_cnn_list.append(f_tr.squeeze(0).cpu().numpy().astype(np.float64))
+        tr_morph_list.append(_extract_stain_morph_features(tile))
+        tr_y_list.append(int(r["label"]))
+
+    probe = OutOfSampleMetastasisProbe(n_pca=6, l2_reg=15.0)
+    probe.fit(
+        np.stack(tr_cnn_list, axis=0),
+        np.stack(tr_morph_list, axis=0),
+        np.array(tr_y_list, dtype=np.int32),
+    )
+
+    ref_cache: dict[str, tuple[int, str, np.ndarray, torch.Tensor, float]] = {}
+    y_test_list: list[int] = []
+    ref_probs: list[float] = []
+
+    for _, r in eval_mf.iterrows():
         tid = str(r["tile_id"])
         idx = int(r["tile_idx"])
         label = int(r["label"])
         cname = str(r["class_name"])
         tile = np.asarray(images[idx], dtype=np.uint8).copy()
         f_ref = feat_extractor.embed(tile)
-        desc_ref = _extract_combined_descriptor(tile, f_ref)
-        ref_items.append((tid, label, cname, tile, f_ref, desc_ref))
-
-    X_ref = np.stack([item[5] for item in ref_items], axis=0)
-    y_ref = np.array([item[1] for item in ref_items], dtype=np.int32)
-    probe_w = _fit_linear_probe(X_ref, y_ref, l2_reg=2.0)
-
-    ref_cache: dict[str, tuple[int, str, np.ndarray, torch.Tensor, float]] = {}
-    ref_probs = []
-    for tid, label, cname, tile, f_ref, desc_ref in ref_items:
-        p_ref = _predict_prob(desc_ref, probe_w)
+        p_ref = probe.predict_prob(tile, f_ref)
+        y_test_list.append(label)
         ref_probs.append(p_ref)
         ref_cache[tid] = (label, cname, tile, f_ref, p_ref)
 
+    y_ref = np.array(y_test_list, dtype=np.int32)
     ref_auroc = compute_auroc(y_ref, np.array(ref_probs))
-    print(f"  Kalibrierter Referenz-Klassifikator (Original CAMELYON16): AUROC = {ref_auroc:.4f}")
+    print(f"  Out-of-Sample Referenz-Klassifikator auf den {len(eval_mf)} Test-Kacheln: AUROC = {ref_auroc:.4f}")
 
     rows: list[B1ResultRow] = []
 
@@ -175,8 +249,7 @@ def run_track_b1(
         label, cname, ref_tile, f_ref, p_ref = ref_cache[tid]
         f_rec = feat_extractor.embed(decoded)
         cos_sim = feat_extractor.cosine_sim(f_ref, f_rec)
-        desc_rec = _extract_combined_descriptor(decoded, f_rec)
-        p_dec = _predict_prob(desc_rec, probe_w)
+        p_dec = probe.predict_prob(decoded, f_rec)
         drift = abs(p_dec - p_ref)
         match = int((p_dec >= 0.5) == (p_ref >= 0.5))
         return B1ResultRow(
@@ -259,7 +332,7 @@ def run_track_b1(
 
     sum_df = pd.DataFrame(summary_list).sort_values(["Codec / Model", "Mean bpp"])
     sum_df.to_csv(summary_csv, index=False)
-    print(f"\n=== Track B1 (CAMELYON16 Metastasis Classification & Feature Drift) Summary ===")
+    print(f"\n=== Track B1 (CAMELYON16 Out-of-Sample Metastasis Classification & Feature Drift) Summary ===")
     print(sum_df.to_string(index=False))
 
     _plot_track_b1(sum_df, len(ref_cache), plot_path)
@@ -290,7 +363,7 @@ def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
         ax.grid(True, linestyle=":", alpha=0.6)
         ax.set_xlabel("Bitrate [bpp]", fontsize=11)
 
-    ax1.set_title("Classification Stability: Tumor vs. Normal AUROC", fontsize=12, fontweight="bold")
+    ax1.set_title("Out-of-Sample Classification: Tumor vs. Normal AUROC", fontsize=12, fontweight="bold")
     ax1.set_ylabel("AUROC", fontsize=11)
     ax1.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
 
@@ -302,22 +375,23 @@ def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
     ax3.set_ylabel("Cosine Similarity vs. Uncompressed", fontsize=11)
     ax3.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
 
-    plt.suptitle(f"Curated Track B1: CAMELYON16 Metastasis & Feature Drift (n={n_tiles} Balanced Tiles)", fontsize=13.5, y=0.99)
+    plt.suptitle(f"Curated Track B1: CAMELYON16 Out-of-Sample Metastasis & Feature Drift (n={n_tiles} Test Tiles)", fontsize=13.5, y=0.99)
     plt.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_path.unlink(missing_ok=True)
     plt.savefig(plot_path, dpi=300)
     plt.close(fig)
     print(f"Track-B1-Plot gespeichert: {plot_path.resolve()}")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate Track B1 (CAMELYON16 Metastasis & Feature Drift).")
+    p = argparse.ArgumentParser(description="Evaluate Track B1 (CAMELYON16 Out-of-Sample Metastasis & Feature Drift).")
     p.add_argument("--data-dir", type=Path, default=Path("camelyon_data"))
     p.add_argument("--manifest", type=Path, default=Path("results/curated_v1/manifest_track_b1_tumor.csv"))
     p.add_argument("--out", type=Path, default=Path("results/curated_v1/results_track_b1_metastasis.csv"))
     p.add_argument("--summary", type=Path, default=Path("results/curated_v1/results_track_b1_summary.csv"))
     p.add_argument("--plot", type=Path, default=Path("results/curated_v1/rd_curves_track_b1_metastasis.png"))
-    p.add_argument("--all-tiles", action="store_true", help="Run all extracted tiles instead of the 40-tile fast subset")
+    p.add_argument("--all-tiles", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     return p.parse_args()
 

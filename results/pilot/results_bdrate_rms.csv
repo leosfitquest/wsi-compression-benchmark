@@ -1,9 +1,9 @@
 Cohort,Codec / Model,BD-Rate PSNR [%],BD-PSNR [dB],BD-Rate MS-SSIM [%],Min bpp,Max bpp
-IDC RMS (Lossless Ground-Truth),cheng2020-attn,-60.17,4.87,-56.9,0.182,0.9
-IDC RMS (Lossless Ground-Truth),bmshj2018-hyperprior,-55.64,4.12,-53.9,0.196,1.752
-IDC RMS (Lossless Ground-Truth),AVIF,-41.43,2.77,-40.29,0.248,1.496
-IDC RMS (Lossless Ground-Truth),JPEG 2000,-41.05,2.35,-35.67,0.119,1.499
-IDC RMS (Lossless Ground-Truth),JPEG XL,-32.53,2.07,-29.05,0.247,1.505
-IDC RMS (Lossless Ground-Truth),WebP,-12.46,0.71,-14.03,0.498,1.514
-IDC RMS (Lossless Ground-Truth),JPEG 4:2:0,-3.61,0.19,-6.9,0.256,1.497
+IDC RMS (Lossless Ground-Truth),cheng2020-attn,-60.13,4.88,-56.92,0.182,0.9
+IDC RMS (Lossless Ground-Truth),bmshj2018-hyperprior,-55.59,4.12,-53.87,0.196,1.752
+IDC RMS (Lossless Ground-Truth),AVIF,-41.29,2.78,-40.11,0.248,1.496
+IDC RMS (Lossless Ground-Truth),JPEG 2000,-41.07,2.36,-35.64,0.119,1.499
+IDC RMS (Lossless Ground-Truth),JPEG XL,-32.41,2.07,-28.77,0.247,1.505
+IDC RMS (Lossless Ground-Truth),WebP,-12.48,0.71,-14.1,0.498,1.514
+IDC RMS (Lossless Ground-Truth),JPEG 4:2:0,-3.87,0.2,-7.1,0.256,1.497
 IDC RMS (Lossless Ground-Truth),JPEG 4:4:4,0.0,0.0,0.0,0.262,1.499
