@@ -2,14 +2,16 @@
 evaluate_track_b2_pannuke.py
 ----------------------------
 Fuehrt den Track-B2-Benchmark auf PanNuke Fold 3 (native 256x256 Tiles, 19 Organe) durch:
-  - 6 konventionelle Codecs (JPEG 4:4:4, JPEG 4:2:0, JPEG 2000, JPEG XL, WebP, AVIF)
-  - 2 CompressAI-Modelle (bmshj2018-hyperprior, cheng2020-attn)
-  - Berechnet pro Kachel und Bitrate:
-      * RGB-PSNR, Y-PSNR, MS-SSIM sowie getrenntes PSNR innerhalb der Ground-Truth-Zellkerne (psnr_nuclei_db)
-      * Deep Feature Cosine Similarity (ResNet-50 Embeddings: cos(f(ref), f(dec)))
-      * Downstream Nuclei Segmentation Drift: Delta Dice, Delta bPQ (binary Panoptic Quality)
-        und Delta mPQ (5-Klassen Multi-Class Panoptic Quality)
-  - Erzeugt Summary-CSVs und den 3-Panel-Plot rd_curves_track_b2_pannuke.png.
+- 6 konventionelle Codecs (JPEG 4:4:4, JPEG 4:2:0, JPEG 2000, JPEG XL, WebP, AVIF)
+- 2 CompressAI-Modelle (bmshj2018-hyperprior, cheng2020-attn)
+- Konfigurierbares Feature-Backbone (`--backbone resnet50 | uni | phikon`):
+    * `resnet50`: ImageNet-1K V2 (lokaler CPU-Pilot)
+    * `uni`: MahmoodLab/UNI ViT-L/16 via `timm` (VUB IPC3 GPU Target)
+    * `phikon`: owkin/phikon ViT-B/16 via `transformers` (VUB IPC3 GPU Target)
+- Konfigurierbares Segmentierungs-Backend (`--seg-backend ruifrok_proxy | hovernet | nnunet`):
+    * `ruifrok_proxy`: Lokaler CPU-Proxy (vs. Ref)
+    * `hovernet` / `nnunet`: GPU-Schnittstellen-Hook fuer den VUB IPC3 Full Run
+- Erzeugt Summary-CSVs und den 3-Panel-Plot rd_curves_track_b2_pannuke.png.
 """
 
 from __future__ import annotations
@@ -18,13 +20,13 @@ import argparse
 import csv
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 
 from benchmark_compressai import (
@@ -66,22 +68,55 @@ class B2ResultRow:
 
 
 class DeepFeatureExtractor:
-    """Extrahiert L2-normierte 2048-D Feature-Vektoren (ResNet-50 ImageNet/Pathology-Backbone)."""
+    """
+    Extrahiert L2-normierte Feature-Vektoren fuer Downstream-Feature-Drift:
+    - `resnet50`: ResNet-50 (ImageNet-1K V2, 2048-D, nativ 256x256 -> lokaler CPU-Pilot)
+    - `uni`: MahmoodLab/UNI Pathology Foundation Model (ViT-L/16, 1024-D, 224x224 -> VUB GPU)
+    - `phikon`: owkin/phikon Pathology Foundation Model (ViT-B/16, 768-D, 224x224 -> VUB GPU)
+    """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, backbone: str = "resnet50") -> None:
         self.device = device
-        weights = models.ResNet50_Weights.DEFAULT
-        backbone = models.resnet50(weights=weights)
-        backbone.fc = nn.Identity()
-        self.model = backbone.eval().to(device)
+        self.backbone = backbone.lower()
+        self.resize_hw: tuple[int, int] | None = None
         self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+        if self.backbone == "resnet50":
+            weights = models.ResNet50_Weights.IMAGENET1K_V2
+            net = models.resnet50(weights=weights)
+            net.fc = nn.Identity()
+            self.model = net.eval().to(device)
+        elif self.backbone == "uni":
+            try:
+                import timm
+            except ImportError as exc:
+                raise ImportError("Fuer --backbone uni bitte `pip install timm huggingface_hub` installieren.") from exc
+            self.model = timm.create_model(
+                "hf-hub:MahmoodLab/UNI", pretrained=True, init_values=1e-5, dynamic_img_size=True
+            ).eval().to(device)
+            self.resize_hw = (224, 224)
+        elif self.backbone == "phikon":
+            try:
+                from transformers import AutoModel
+            except ImportError as exc:
+                raise ImportError("Fuer --backbone phikon bitte `pip install transformers` installieren.") from exc
+            self.model = AutoModel.from_pretrained("owkin/phikon").eval().to(device)
+            self.resize_hw = (224, 224)
+        else:
+            raise ValueError(f"Unbekanntes Backbone '{backbone}'. Erlaubt: resnet50, uni, phikon.")
 
     @torch.inference_mode()
     def embed(self, tile: np.ndarray) -> torch.Tensor:
         x = torch.from_numpy(tile).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(self.device)
+        if self.resize_hw is not None and (x.shape[-2], x.shape[-1]) != self.resize_hw:
+            x = F.interpolate(x, size=self.resize_hw, mode="bicubic", align_corners=False)
         x = (x - self.mean) / self.std
-        feat = self.model(x)
+        if self.backbone == "phikon":
+            out = self.model(pixel_values=x)
+            feat = out.last_hidden_state[:, 0, :]
+        else:
+            feat = self.model(x)
         return feat / (feat.norm(dim=-1, keepdim=True) + 1e-8)
 
     @staticmethod
@@ -137,7 +172,6 @@ def _fast_connected_components_2d(binary_mask: np.ndarray) -> np.ndarray:
         remap[i] = remap[root]
 
     out = remap[labels]
-    # Kleine Rausch-Artefakte (< 12 Pixel) filtern
     if cur > 1:
         areas = np.bincount(out.ravel())
         small = areas < 12
@@ -146,11 +180,20 @@ def _fast_connected_components_2d(binary_mask: np.ndarray) -> np.ndarray:
     return out
 
 
-def predict_nuclei_instances(tile: np.ndarray, gt_5ch: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Extrahiert aus dem Haematoxylin-Kanal (Ruifrok OD) die Zellkern-Instanzen eines (dekodierten) Tiles
-    und ordnet sie den 5 PanNuke-Zellklassen zu, um den kompressionsbedingten Masken-/Instanz-Drift
-    (Delta Dice, Delta bPQ, Delta mPQ) exakt zu messen.
+def predict_nuclei_instances(
+    tile: np.ndarray, gt_5ch: np.ndarray, seg_backend: str = "ruifrok_proxy"
+) -> tuple[np.ndarray, list[np.ndarray]]:
     """
+    Liefert binaere & 5-Klassen-Kerninstanzen fuer Track B2:
+    - `ruifrok_proxy`: Lokaler CPU-Pilot-Proxy (Ruifrok Haematoxylin OD).
+    - `hovernet` / `nnunet`: Reservierte GPU-Hooks fuer den VUB IPC3 Full Run (TIAToolbox HoVer-Net / nnU-Net).
+    """
+    if seg_backend in ("hovernet", "nnunet"):
+        raise NotImplementedError(
+            f"GPU segmentation backend '{seg_backend}' is scheduled for VUB IPC3 GPU deployment "
+            "(load TIAToolbox HoVer-Net PanNuke weights or nnU-Net checkpoint on cluster)."
+        )
+
     od = -np.log10(np.clip(tile.astype(np.float64), 1.0, 255.0) / 255.0)
     h_stain = (od @ _INV_STAIN_MAT)[..., 0]
 
@@ -165,7 +208,6 @@ def predict_nuclei_instances(tile: np.ndarray, gt_5ch: np.ndarray) -> tuple[np.n
     bin_pred = h_stain >= thresh
     inst_bin = _fast_connected_components_2d(bin_pred)
 
-    # Fuer Multi-Class mPQ: Klassenzuordnung pro detektierter Instanz
     class_insts: list[np.ndarray] = []
     for c in range(5):
         c_region = gt_5ch[..., c] > 0
@@ -250,6 +292,8 @@ def run_track_b2(
     plot_path: Path,
     fast_only: bool = True,
     limit: int | None = None,
+    backbone: str = "resnet50",
+    seg_backend: str = "ruifrok_proxy",
 ) -> None:
     u8_path = data_dir / "images_u8.npy"
     masks_path = data_dir / "masks_u16.npz"
@@ -265,11 +309,13 @@ def run_track_b2(
         mf = mf.head(limit).copy()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Track B2] Starte Evaluation auf {len(mf)} PanNuke-Kacheln ({mf['organ'].nunique()} Organe, Device={device})...")
-    feat_extractor = DeepFeatureExtractor(device)
+    print(
+        f"[Track B2] Starte Evaluation auf {len(mf)} PanNuke-Kacheln "
+        f"({mf['organ'].nunique()} Organe, Device={device}, Backbone={backbone}, Seg={seg_backend})..."
+    )
+    feat_extractor = DeepFeatureExtractor(device, backbone=backbone)
     codecs = build_codecs(jxl_effort=7, verbose=False)
 
-    # Vorberechnung der Referenz-Features und Referenz-Kerninstanzen auf den Original-Tiles
     ref_cache: dict[str, tuple[int, str, np.ndarray, np.ndarray, torch.Tensor, np.ndarray, list[np.ndarray]]] = {}
     for _, r in mf.iterrows():
         tid = str(r["tile_id"])
@@ -278,7 +324,7 @@ def run_track_b2(
         tile = np.asarray(images[idx], dtype=np.uint8).copy()
         gt_5ch = masks_all[idx]
         f_ref = feat_extractor.embed(tile)
-        ref_inst, ref_class_insts = predict_nuclei_instances(tile, gt_5ch)
+        ref_inst, ref_class_insts = predict_nuclei_instances(tile, gt_5ch, seg_backend=seg_backend)
         ref_cache[tid] = (idx, organ, tile, gt_5ch, f_ref, ref_inst, ref_class_insts)
 
     rows: list[B2ResultRow] = []
@@ -298,7 +344,7 @@ def run_track_b2(
         f_rec = feat_extractor.embed(decoded)
         cos_sim = feat_extractor.cosine_sim(f_ref, f_rec)
 
-        rec_inst, rec_class_insts = predict_nuclei_instances(decoded, gt_5ch)
+        rec_inst, rec_class_insts = predict_nuclei_instances(decoded, gt_5ch, seg_backend=seg_backend)
         dice_val = compute_dice(ref_inst > 0, rec_inst > 0)
         bpq_val = fast_pq(ref_inst, rec_inst)
         mpq_vals = [
@@ -327,7 +373,6 @@ def run_track_b2(
             mpq_vs_ref=round(mpq_val, 4),
         )
 
-    # 1. Konventionelle Codecs
     print("[1/2] Evaluierung der 6 konventionellen Codecs...")
     for i, (tid, (_, _, ref_tile, _, _, _, _)) in enumerate(ref_cache.items(), start=1):
         h, w = ref_tile.shape[:2]
@@ -341,7 +386,6 @@ def run_track_b2(
         if i % 5 == 0 or i == len(ref_cache):
             print(f"  Konventionell: [{i}/{len(ref_cache)}] Kacheln fertig.")
 
-    # 2. CompressAI Modelle (Qualities 1..6 fuer schnellen, abdeckenden R-D-Verlauf)
     print("[2/2] Evaluierung der CompressAI-Modelle (bmshj2018-hyperprior & cheng2020-attn)...")
     cpu = torch.device("cpu")
     for model_name in ("bmshj2018-hyperprior", "cheng2020-attn"):
@@ -369,7 +413,6 @@ def run_track_b2(
         or (abs(g["bpp"].mean() - g["target_bpp"].iloc[0]) / g["target_bpp"].iloc[0] <= 0.15)
     )
 
-    grp_key = ["codec_or_model", "setting"] if "setting" in df_valid.columns else ["codec_or_model", "target_bpp"]
     summary_list = []
     for (name, bucket), grp in df_valid.groupby(
         ["codec_or_model", df_valid["target_bpp"].where(df_valid["category"] == "conventional", df_valid["setting"])]
@@ -391,13 +434,14 @@ def run_track_b2(
     print(f"\n=== Track B2 (PanNuke Fold 3, {df['organ'].nunique()} Organe) Downstream Summary ===")
     print(sum_df.to_string(index=False))
 
-    # Plot erstellen: 1. bPQ vs. bpp, 2. Dice vs. bpp, 3. Feature Cosine Similarity vs. bpp
-    _plot_track_b2(sum_df, len(ref_cache), df["organ"].nunique(), plot_path)
+    _plot_track_b2(sum_df, len(ref_cache), df["organ"].nunique(), plot_path, backbone=backbone)
 
 
-def _plot_track_b2(sum_df: pd.DataFrame, n_tiles: int, n_organs: int, plot_path: Path) -> None:
+def _plot_track_b2(
+    sum_df: pd.DataFrame, n_tiles: int, n_organs: int, plot_path: Path, backbone: str = "resnet50"
+) -> None:
     styles = {
-        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif)", "linestyle": "-"},
+        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif, 4:4:4)", "linestyle": "-"},
         "JPEG XL":              {"color": "#2ca02c", "marker": "^", "label": "JPEG XL (libjxl)", "linestyle": "-"},
         "WebP":                 {"color": "#17becf", "marker": "p", "label": "WebP (libwebp)", "linestyle": "-"},
         "JPEG 2000":            {"color": "#1f77b4", "marker": "s", "label": "JPEG 2000 (OpenJPEG)", "linestyle": "-"},
@@ -427,12 +471,13 @@ def _plot_track_b2(sum_df: pd.DataFrame, n_tiles: int, n_organs: int, plot_path:
     ax2.set_title("Nuclei Mask Overlap: Dice Score", fontsize=12, fontweight="bold")
     ax2.set_ylabel("Dice Similarity Coefficient", fontsize=11)
 
-    ax3.set_title("Deep Feature Cosine Similarity (ResNet-50)", fontsize=12, fontweight="bold")
+    ax3.set_title(f"Deep Feature Cosine Similarity ({backbone.upper()})", fontsize=12, fontweight="bold")
     ax3.set_ylabel("Cosine Similarity vs. Uncompressed", fontsize=11)
 
     plt.suptitle(f"Curated Track B2: PanNuke Fold 3 Downstream Stability (n={n_tiles} Tiles across {n_organs} Organs)", fontsize=13.5, y=0.99)
     plt.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_path.unlink(missing_ok=True)
     plt.savefig(plot_path, dpi=300)
     plt.close(fig)
     print(f"\nTrack-B2-Plot gespeichert: {plot_path.resolve()}")
@@ -445,6 +490,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=Path, default=Path("results/curated_v1/results_track_b2_pannuke.csv"))
     p.add_argument("--summary", type=Path, default=Path("results/curated_v1/results_track_b2_summary.csv"))
     p.add_argument("--plot", type=Path, default=Path("results/curated_v1/rd_curves_track_b2_pannuke.png"))
+    p.add_argument("--backbone", choices=("resnet50", "uni", "phikon"), default="resnet50", help="Feature backbone (use uni/phikon on VUB GPU)")
+    p.add_argument("--seg-backend", choices=("ruifrok_proxy", "hovernet", "nnunet"), default="ruifrok_proxy", help="Segmentation backend (hovernet/nnunet on VUB GPU)")
     p.add_argument("--all-tiles", action="store_true", help="Run all 2,722 tiles instead of the 38-tile 19-organ fast subset")
     p.add_argument("--limit", type=int, default=None)
     return p.parse_args()
@@ -455,4 +502,5 @@ if __name__ == "__main__":
     run_track_b2(
         args.data_dir, args.manifest, args.out, args.summary, args.plot,
         fast_only=not args.all_tiles, limit=args.limit,
+        backbone=args.backbone, seg_backend=args.seg_backend,
     )

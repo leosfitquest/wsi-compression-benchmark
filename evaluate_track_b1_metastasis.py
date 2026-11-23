@@ -2,18 +2,14 @@
 evaluate_track_b1_metastasis.py
 -------------------------------
 Fuehrt den Track-B1-Benchmark (CAMELYON16 Metastasis Classification & Deep Feature Drift) durch:
-  - 6 konventionelle Codecs (JPEG 4:4:4, JPEG 4:2:0, JPEG 2000, JPEG XL, WebP, AVIF)
-  - 2 CompressAI-Modelle (bmshj2018-hyperprior, cheng2020-attn)
-  - Trainiert den Linear-Probe-Klassifikator STRIKT OUT-OF-SAMPLE auf den nicht im
-    Test-Subset enthaltenen CAMELYON16-Kacheln (N_train = 368 balancierte Kacheln, ~is_fast_subset)
-    mit dimensionsreduziertem, gegen 8x8-Scanner-Gitter robustem Histologie-Deskriptor
-    (8 Ruifrok-Haematoxylin/Morphologie-Merkmale + Top-6-PCA-Komponenten von ResNet-50 = 15 Parameter,
-    N_train >> d) und evaluiere out-of-sample auf den N_test = 40 Fast-Subset-Kacheln:
-      * Classification AUROC und Delta-AUROC vs. Reference
-      * Tumor Probability Drift |P_dec(tumor) - P_ref(tumor)| (niedriger = stabiler)
-      * Classification Decision Agreement [%]
-      * Deep Feature Cosine Similarity cos(f(ref), f(dec))
-  - Erzeugt Summary-CSV und den 3-Panel-Plot rd_curves_track_b1_metastasis.png.
+- 6 konventionelle Codecs (JPEG 4:4:4, JPEG 4:2:0, JPEG 2000, JPEG XL, WebP, AVIF)
+- 2 CompressAI-Modelle (bmshj2018-hyperprior, cheng2020-attn)
+- Konfigurierbares Feature-Backbone (`--backbone resnet50 | uni | phikon`):
+    * `resnet50` (ImageNet-1K V2, lokaler CPU-Pilot)
+    * `uni` / `phikon` (Pathology Foundation Models fuer den VUB IPC3 GPU Full Run)
+- Misst AUROC, Delta-AUROC, Tumor Probability Drift |P_dec(tumor) - P_ref(tumor)|,
+  Classification Decision Agreement [%] und Deep Feature Cosine Similarity.
+- Erzeugt Summary-CSV und den 3-Panel-Plot rd_curves_track_b1_metastasis.png.
 """
 
 from __future__ import annotations
@@ -102,13 +98,7 @@ def _extract_stain_morph_features(tile: np.ndarray) -> np.ndarray:
 
 
 class OutOfSampleMetastasisProbe:
-    """
-    Kompakter Out-of-Sample Linear Probe (d = 15 Parameter, trainiert auf N_train = 368 Kacheln):
-    Verhindert das Memorieren des 8x8-Scanner-JPEG-Gitters durch:
-      1. Z-Score-Standardisierung auf dem unabhaengigen Trainings-Split (~is_fast_subset)
-      2. Top-6 PCA-Projektion der 2048-D ResNet-50-Embeddings (verwirft 2042 hochfrequente Gitter-Rauschdimensionen)
-      3. Kombination mit den 8 Ruifrok-Haematoxylin/Eosin-Morphologie-Merkmalen
-    """
+    """Kompakter Linear Probe (d = 15 Parameter: 8 Ruifrok-Merkmale + Top-6 PCA-Embeddings + Bias)."""
 
     def __init__(self, n_pca: int = 6, l2_reg: float = 15.0) -> None:
         self.n_pca = n_pca
@@ -124,7 +114,7 @@ class OutOfSampleMetastasisProbe:
         centered = cnn_mat - self.cnn_mean
         _, _, vt = np.linalg.svd(centered, full_matrices=False)
         k = min(self.n_pca, vt.shape[0])
-        self.pca_components = vt[:k].T  # (2048, k)
+        self.pca_components = vt[:k].T
 
         cnn_pca = centered @ self.pca_components
         raw_x = np.concatenate([morph_mat, cnn_pca], axis=1)
@@ -165,6 +155,7 @@ def run_track_b1(
     plot_path: Path,
     fast_only: bool = True,
     limit: int | None = None,
+    backbone: str = "resnet50",
 ) -> None:
     npy_path = data_dir / "b1_tiles_u8.npy"
     if not npy_path.exists() or not manifest_path.exists():
@@ -190,10 +181,10 @@ def run_track_b1(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(
-        f"[Track B1] Kalibriere Out-of-Sample-Klassifikator auf {len(train_bal_mf)} Trainings-Kacheln "
-        f"(d=15 Parameter) und evaluiere auf {len(eval_mf)} Test-Kacheln (Device={device})..."
+        f"[Track B1] Kalibriere Held-Out-Klassifikator auf {len(train_bal_mf)} Trainings-Kacheln "
+        f"(d=15 Parameter, Backbone={backbone}) und evaluiere auf {len(eval_mf)} Test-Kacheln (Device={device})..."
     )
-    feat_extractor = DeepFeatureExtractor(device)
+    feat_extractor = DeepFeatureExtractor(device, backbone=backbone)
     codecs = build_codecs(jxl_effort=7, verbose=False)
 
     tr_cnn_list: list[np.ndarray] = []
@@ -232,7 +223,7 @@ def run_track_b1(
 
     y_ref = np.array(y_test_list, dtype=np.int32)
     ref_auroc = compute_auroc(y_ref, np.array(ref_probs))
-    print(f"  Out-of-Sample Referenz-Klassifikator auf den {len(eval_mf)} Test-Kacheln: AUROC = {ref_auroc:.4f}")
+    print(f"  Referenz-Klassifikator auf den {len(eval_mf)} Test-Kacheln: AUROC = {ref_auroc:.4f}")
 
     rows: list[B1ResultRow] = []
 
@@ -332,15 +323,17 @@ def run_track_b1(
 
     sum_df = pd.DataFrame(summary_list).sort_values(["Codec / Model", "Mean bpp"])
     sum_df.to_csv(summary_csv, index=False)
-    print(f"\n=== Track B1 (CAMELYON16 Out-of-Sample Metastasis Classification & Feature Drift) Summary ===")
+    print(f"\n=== Track B1 (CAMELYON16 Metastasis Classification & Feature Drift, Backbone={backbone}) Summary ===")
     print(sum_df.to_string(index=False))
 
-    _plot_track_b1(sum_df, len(ref_cache), plot_path)
+    _plot_track_b1(sum_df, len(ref_cache), plot_path, backbone=backbone)
 
 
-def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
+def _plot_track_b1(
+    sum_df: pd.DataFrame, n_tiles: int, plot_path: Path, backbone: str = "resnet50"
+) -> None:
     styles = {
-        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif)", "linestyle": "-"},
+        "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif, 4:4:4)", "linestyle": "-"},
         "JPEG XL":              {"color": "#2ca02c", "marker": "^", "label": "JPEG XL (libjxl)", "linestyle": "-"},
         "WebP":                 {"color": "#17becf", "marker": "p", "label": "WebP (libwebp)", "linestyle": "-"},
         "JPEG 2000":            {"color": "#1f77b4", "marker": "s", "label": "JPEG 2000 (OpenJPEG)", "linestyle": "-"},
@@ -363,7 +356,7 @@ def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
         ax.grid(True, linestyle=":", alpha=0.6)
         ax.set_xlabel("Bitrate [bpp]", fontsize=11)
 
-    ax1.set_title("Out-of-Sample Classification: Tumor vs. Normal AUROC", fontsize=12, fontweight="bold")
+    ax1.set_title("Held-Out Classification: Tumor vs. Normal AUROC", fontsize=12, fontweight="bold")
     ax1.set_ylabel("AUROC", fontsize=11)
     ax1.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
 
@@ -371,11 +364,11 @@ def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
     ax2.set_ylabel("Mean Absolute Probability Drift", fontsize=11)
     ax2.legend(loc="upper right", fontsize=8.5, framealpha=0.9)
 
-    ax3.set_title("Deep Feature Cosine Similarity (ResNet-50)", fontsize=12, fontweight="bold")
+    ax3.set_title(f"Deep Feature Cosine Similarity ({backbone.upper()})", fontsize=12, fontweight="bold")
     ax3.set_ylabel("Cosine Similarity vs. Uncompressed", fontsize=11)
     ax3.legend(loc="lower right", fontsize=8.5, framealpha=0.9)
 
-    plt.suptitle(f"Curated Track B1: CAMELYON16 Out-of-Sample Metastasis & Feature Drift (n={n_tiles} Test Tiles)", fontsize=13.5, y=0.99)
+    plt.suptitle(f"Curated Track B1: CAMELYON16 Metastasis & Feature Drift (n={n_tiles} Test Tiles)", fontsize=13.5, y=0.99)
     plt.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     plot_path.unlink(missing_ok=True)
@@ -385,12 +378,13 @@ def _plot_track_b1(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate Track B1 (CAMELYON16 Out-of-Sample Metastasis & Feature Drift).")
+    p = argparse.ArgumentParser(description="Evaluate Track B1 (CAMELYON16 Metastasis & Feature Drift).")
     p.add_argument("--data-dir", type=Path, default=Path("camelyon_data"))
     p.add_argument("--manifest", type=Path, default=Path("results/curated_v1/manifest_track_b1_tumor.csv"))
     p.add_argument("--out", type=Path, default=Path("results/curated_v1/results_track_b1_metastasis.csv"))
     p.add_argument("--summary", type=Path, default=Path("results/curated_v1/results_track_b1_summary.csv"))
     p.add_argument("--plot", type=Path, default=Path("results/curated_v1/rd_curves_track_b1_metastasis.png"))
+    p.add_argument("--backbone", choices=("resnet50", "uni", "phikon"), default="resnet50", help="Feature backbone (use uni/phikon on VUB GPU)")
     p.add_argument("--all-tiles", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     return p.parse_args()
@@ -400,5 +394,5 @@ if __name__ == "__main__":
     args = parse_args()
     run_track_b1(
         args.data_dir, args.manifest, args.out, args.summary, args.plot,
-        fast_only=not args.all_tiles, limit=args.limit,
+        fast_only=not args.all_tiles, limit=args.limit, backbone=args.backbone,
     )

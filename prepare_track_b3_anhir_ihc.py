@@ -2,13 +2,15 @@
 prepare_track_b3_anhir_ihc.py
 -----------------------------
 100% Original-Daten-Pipeline fuer Track B3 (ANHIR IHC / DAB):
-  - Nutzt die 16 echten, hochaufloesenden `scale-100pc/*.png` IHC-Schnitte vom CTU-Prag-Server
-    (`lung-lobes_1..4`: je 4x CD31, CC10, Ki67, Pro-SPC) in `anhir_data/raw_slides/`
-    (oder laedt sie per --user / --password nach, falls der Ordner noch leer ist).
-  - Schliesst reine H&E-Referenzschnitte (`1-HE.png`) strikt aus dem IHC/DAB-Benchmark aus.
-  - Erkennt `Pro-SPC` (mit Bindestrich) exakt als `ANHIR_PROSPC` statt als `ANHIR_PR`.
-  - Zieht balanciert exakt 125 verifizierte, verlustfreie 256x256 Gewebekacheln pro IHC-Slide
-    (= 500 Kacheln pro Marker CD31, CC10, Ki67, Pro-SPC -> 2.000 Kacheln gesamt, 40 im Fast-Subset).
+- VUB GPU Default (`--mag-mode 40x_only`): Ausschliesslich die beiden echten 40x
+  verlustfreien Mikroskop-Subsets nach Borovec et al. (IEEE TMI 2020, Table I & S.I):
+    * `gastric` (Leica DM LB2 Mikroskop, 40x human, 0.2528 um/px, 9 Sets: CD4, CD8, CD68, CD1a, LMP-1/EBV)
+    * `lung-lesion` (Zeiss Axio Imager M1, 40x Maus, 0.174 um/px, 3 Sets: CD31, CC10, Ki67, Pro-SPC)
+- Option `--mag-mode all_microscope`: Schaltet zusaetzlich die 10x-Mikroskop-Subsets
+  (`lung-lobes` 1.274 um/px & `mammary-gland` 2.294 um/px) fuer lokale Piloten frei.
+- Schliesst WSI-Scanner-Subsets (`human-breast` Aperio AT2, `mice-kidney` Hamamatsu,
+  `coad` 3DHistech, `kidney` Aperio) sowie reine H&E-Schnitte strikt aus.
+- Deterministischer, dateinamen-basierter RNG-Seed (sha256) und Regex-Wortgrenzen fuer Marker.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import re
 import urllib.request
 from pathlib import Path
@@ -30,7 +33,29 @@ Image.MAX_IMAGE_PIXELS = None
 ANHIR_BASE_URL = "http://ptak.felk.cvut.cz/Medical/dataset_ANHIR/images"
 ANHIR_CSV_URL = f"{ANHIR_BASE_URL}/dataset_medium.csv"
 
-LOSSLESS_SUBSETS = ("lung-lesion", "lung-lobes", "mammary-gland")
+# Verifizierte optische Mikroskop-Subsets (Borovec et al., IEEE TMI 2020, Table I & S.I)
+LOSSLESS_40X_SUBSETS = ("gastric", "lung-lesion")
+LOSSLESS_ALL_MICROSCOPE_SUBSETS = ("gastric", "lung-lesion", "lung-lobes", "mammary-gland")
+# Hart ausgeschlossene klinische WSI-Scanner-Subsets (lossy beim Scan)
+EXCLUDED_WSI_SUBSETS = ("breast", "mice-kidney", "kidney", "coad")
+
+_STAIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("ANHIR_PROSPC", re.compile(r"(?:^|[^a-z0-9])pro[-_]?spc(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CD31",   re.compile(r"(?:^|[^a-z0-9])cd[-_]?31(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_KI67",   re.compile(r"(?:^|[^a-z0-9])ki[-_]?67(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CC10",   re.compile(r"(?:^|[^a-z0-9])cc[-_]?10(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_HER2",   re.compile(r"(?:^|[^a-z0-9])her[-_]?2(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CD68",   re.compile(r"(?:^|[^a-z0-9])cd[-_]?68(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CD1A",   re.compile(r"(?:^|[^a-z0-9])cd[-_]?1a(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CD4",    re.compile(r"(?:^|[^a-z0-9])cd[-_]?4(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_CD8",    re.compile(r"(?:^|[^a-z0-9])cd[-_]?8(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_LMP1",   re.compile(r"(?:^|[^a-z0-9])(lmp[-_]?1|ebv)(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_ER",     re.compile(r"(?:^|[^a-z0-9])er(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_PR",     re.compile(r"(?:^|[^a-z0-9])pr(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_PAS",    re.compile(r"(?:^|[^a-z0-9])pas(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_MAS",    re.compile(r"(?:^|[^a-z0-9])(mas|masson)(?:$|[^a-z0-9])", re.I)),
+    ("ANHIR_HE",     re.compile(r"(?:^|[^a-z0-9])(h&?e|he)(?:$|[^a-z0-9])", re.I)),
+]
 
 _H_VEC = np.array([0.650, 0.704, 0.286], dtype=np.float64)
 _DAB_VEC = np.array([0.268, 0.570, 0.776], dtype=np.float64)
@@ -55,13 +80,33 @@ MANIFEST_B3_FIELDS = [
 ]
 
 
+def _allowed_subsets(mag_mode: str) -> tuple[str, ...]:
+    if mag_mode == "40x_only":
+        return LOSSLESS_40X_SUBSETS
+    if mag_mode == "all_microscope":
+        return LOSSLESS_ALL_MICROSCOPE_SUBSETS
+    raise ValueError(f"Unbekannter mag_mode='{mag_mode}'. Erlaubt: '40x_only', 'all_microscope'.")
+
+
+def _is_allowed_slide_path(path_str: str, allowed_subsets: tuple[str, ...]) -> bool:
+    low = path_str.lower()
+    if any(ex in low for ex in EXCLUDED_WSI_SUBSETS):
+        return False
+    return any(sub in low for sub in allowed_subsets)
+
+
 def _detect_stain_name(filename: str) -> str:
-    """Erkennt den IHC-Marker robust (entfernt Bindestriche/Unterstriche vor dem Substring-Check)."""
-    low_clean = filename.lower().replace("-", "").replace("_", "")
-    for st in ("cd31", "ki67", "prospc", "cc10", "her2", "er", "pr", "pas", "mas", "he"):
-        if st in low_clean:
-            return f"ANHIR_{st.upper()}"
+    """Erkennt den IHC-Marker per Regex-Token-Grenzen (kein False-Match auf 'upper_HE' oder 'other')."""
+    for label, pat in _STAIN_PATTERNS:
+        if pat.search(filename):
+            return label
     return "ANHIR_IHC"
+
+
+def _slide_rng(filename: str, base_seed: int = 42) -> np.random.Generator:
+    """Deterministischer RNG abgeleitet aus Dateiname + Seed (unabhaengig von slide_idx)."""
+    digest = hashlib.sha256(f"{base_seed}:{filename}".encode("utf-8")).digest()
+    return np.random.default_rng(int.from_bytes(digest[:8], "little"))
 
 
 def _fetch_with_auth(url: str, user: str | None, password: str | None, timeout: int = 30) -> bytes:
@@ -78,12 +123,13 @@ def _download_individual_anhir_pngs(
     raw_dir: Path,
     user: str | None,
     password: str | None,
-    max_slides: int = 24,
+    allowed_subsets: tuple[str, ...],
+    max_slides: int = 60,
 ) -> list[Path]:
     if not user or not password:
         return []
 
-    print(f"[ANHIR Server] Lade Dateiliste von {ANHIR_CSV_URL} ...")
+    print(f"[ANHIR Server] Lade Dateiliste von {ANHIR_CSV_URL} (Subsets: {allowed_subsets}) ...")
     csv_bytes = _fetch_with_auth(ANHIR_CSV_URL, user, password)
     csv_text = csv_bytes.decode("utf-8", errors="replace")
 
@@ -93,7 +139,7 @@ def _download_individual_anhir_pngs(
         clean = token.lstrip("/")
         if clean.startswith("images/"):
             clean = clean[len("images/"):]
-        if clean not in seen and any(sub in clean.lower() for sub in LOSSLESS_SUBSETS):
+        if clean not in seen and _is_allowed_slide_path(clean, allowed_subsets):
             if _detect_stain_name(Path(clean).stem) == "ANHIR_HE":
                 continue
             seen.add(clean)
@@ -146,31 +192,44 @@ def prepare_verified_anhir_b3(
     manifest_path: Path,
     user: str | None = None,
     password: str | None = None,
+    mag_mode: str = "40x_only",
     max_tiles: int = 2000,
     fast_subset_size: int = 40,
-    max_slides: int = 24,
+    max_slides: int = 60,
     min_slide_dim: int = 1024,
-    max_blockiness: float = 1.03,
+    max_blockiness: float | None = None,
 ) -> None:
+    allowed_subsets = _allowed_subsets(mag_mode)
     raw_dir = data_dir / "raw_slides"
     raw_dir.mkdir(parents=True, exist_ok=True)
     out_npy = data_dir / "ihc_tiles_u8.npy"
 
-    # Filtere vorhandene PNGs strikt auf echte IHC-Faerbungen (ohne ANHIR_HE Referenzschnitte!)
     all_pngs = sorted(raw_dir.rglob("*.png"))
-    ihc_files = [p for p in all_pngs if _detect_stain_name(p.stem) != "ANHIR_HE"]
+    ihc_files = [
+        p for p in all_pngs
+        if _is_allowed_slide_path(str(p), allowed_subsets) and _detect_stain_name(p.stem) != "ANHIR_HE"
+    ]
 
     if not ihc_files and user and password:
-        _download_individual_anhir_pngs(raw_dir, user=user, password=password, max_slides=max_slides)
+        _download_individual_anhir_pngs(
+            raw_dir, user=user, password=password, allowed_subsets=allowed_subsets, max_slides=max_slides
+        )
         all_pngs = sorted(raw_dir.rglob("*.png"))
-        ihc_files = [p for p in all_pngs if _detect_stain_name(p.stem) != "ANHIR_HE"]
+        ihc_files = [
+            p for p in all_pngs
+            if _is_allowed_slide_path(str(p), allowed_subsets) and _detect_stain_name(p.stem) != "ANHIR_HE"
+        ]
 
     if not ihc_files:
         raise FileNotFoundError(
-            f"\n[STOP] Keine ANHIR IHC .png-Originaldateien in '{raw_dir.resolve()}' gefunden!"
+            f"\n[STOP] Keine ANHIR IHC .png-Originaldateien fuer mag_mode='{mag_mode}' "
+            f"(Subsets: {allowed_subsets}) in '{raw_dir.resolve()}' gefunden!"
         )
 
-    print(f"[ANHIR IHC] {len(ihc_files)} echte IHC/DAB-Slides gefunden (H&E-Slides ausgeschlossen).")
+    print(
+        f"[ANHIR IHC] {len(ihc_files)} echte IHC/DAB-Slides fuer mag_mode='{mag_mode}' "
+        f"(Subsets: {allowed_subsets}; WSI-Scanner & H&E ausgeschlossen)."
+    )
 
     collected: list[tuple[str, str, str, np.ndarray]] = []
     skipped_small = 0
@@ -195,7 +254,7 @@ def prepare_verified_anhir_b3(
             for y in range(0, h - 256 + 1, 256)
             for x in range(0, w - 256 + 1, 256)
         ]
-        rng = np.random.default_rng(42 + slide_idx)
+        rng = _slide_rng(p.name, base_seed=42)
         order = rng.permutation(len(coords))
 
         slide_count = 0
@@ -207,11 +266,11 @@ def prepare_verified_anhir_b3(
             pm = patch.mean(axis=-1)
             if float(np.mean((pm >= 25.0) & (pm <= 225.0))) < 0.70:
                 continue
-            if measure_8x8_blockiness(patch) > max_blockiness:
+            if max_blockiness is not None and measure_8x8_blockiness(patch) > max_blockiness:
                 skipped_blocky += 1
                 continue
             tid = f"anhir_{p.stem}_x{x}_y{y}"
-            collected.append((tid, "ANHIR_CTU_PNG", stain, patch.copy()))
+            collected.append((tid, f"ANHIR_CTU_PNG_{mag_mode}", stain, patch.copy()))
             slide_count += 1
 
         print(f"  [{slide_idx+1}/{len(ihc_files)}] {p.name} ({stain}): {slide_count} Kacheln extrahiert.")
@@ -270,11 +329,20 @@ if __name__ == "__main__":
     p.add_argument("--manifest", type=Path, default=Path("results/curated_v1/manifest_track_b3_ihc.csv"))
     p.add_argument("--user", type=str, default=None)
     p.add_argument("--password", type=str, default=None)
+    p.add_argument(
+        "--mag-mode",
+        choices=("40x_only", "all_microscope"),
+        default="40x_only",
+        help="40x_only = Gastric (Leica 40x) + Lung lesions (Zeiss 40x) [VUB GPU default]; all_microscope adds 10x lung-lobes/mammary-gland.",
+    )
     p.add_argument("--max-tiles", type=int, default=2000)
     p.add_argument("--fast-subset-size", type=int, default=40)
-    p.add_argument("--max-slides", type=int, default=24)
+    p.add_argument("--max-slides", type=int, default=60)
+    p.add_argument("--max-blockiness", type=float, default=None, help="Optional blockiness filter (None avoids truncation bias on lossless PNGs)")
     args = p.parse_args()
     prepare_verified_anhir_b3(
         args.data_dir, args.manifest, user=args.user, password=args.password,
-        max_tiles=args.max_tiles, fast_subset_size=args.fast_subset_size, max_slides=args.max_slides,
+        mag_mode=args.mag_mode, max_tiles=args.max_tiles,
+        fast_subset_size=args.fast_subset_size, max_slides=args.max_slides,
+        max_blockiness=args.max_blockiness,
     )
