@@ -95,7 +95,7 @@ class DeepFeatureExtractor:
             self.model = timm.create_model(
                 "hf-hub:MahmoodLab/UNI", pretrained=True, init_values=1e-5, dynamic_img_size=True
             ).eval().to(device)
-            self.resize_hw = (224, 224)
+            self.resize_hw = None  # UNI dynamic_img_size=True processes native 256x256 (16x16 patches) without downsampling
         elif self.backbone == "phikon":
             try:
                 from transformers import AutoModel
@@ -110,7 +110,7 @@ class DeepFeatureExtractor:
     def embed(self, tile: np.ndarray) -> torch.Tensor:
         x = torch.from_numpy(tile).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(self.device)
         if self.resize_hw is not None and (x.shape[-2], x.shape[-1]) != self.resize_hw:
-            x = F.interpolate(x, size=self.resize_hw, mode="bicubic", align_corners=False)
+            x = F.interpolate(x, size=self.resize_hw, mode="bicubic", align_corners=False, antialias=True).clamp(0.0, 1.0)
         x = (x - self.mean) / self.std
         if self.backbone == "phikon":
             out = self.model(pixel_values=x)

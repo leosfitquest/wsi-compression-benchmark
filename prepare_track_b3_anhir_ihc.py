@@ -38,6 +38,7 @@ LOSSLESS_40X_SUBSETS = ("gastric", "lung-lesion")
 LOSSLESS_ALL_MICROSCOPE_SUBSETS = ("gastric", "lung-lesion", "lung-lobes", "mammary-gland")
 # Hart ausgeschlossene klinische WSI-Scanner-Subsets (lossy beim Scan)
 EXCLUDED_WSI_SUBSETS = ("breast", "mice-kidney", "kidney", "coad")
+NON_IHC_STAINS = {"ANHIR_HE", "ANHIR_PAS", "ANHIR_MAS"}
 
 _STAIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("ANHIR_PROSPC", re.compile(r"(?:^|[^a-z0-9])pro[-_]?spc(?:$|[^a-z0-9])", re.I)),
@@ -140,7 +141,7 @@ def _download_individual_anhir_pngs(
         if clean.startswith("images/"):
             clean = clean[len("images/"):]
         if clean not in seen and _is_allowed_slide_path(clean, allowed_subsets):
-            if _detect_stain_name(Path(clean).stem) == "ANHIR_HE":
+            if _detect_stain_name(Path(clean).stem) in NON_IHC_STAINS:
                 continue
             seen.add(clean)
             rel_paths.append(clean)
@@ -207,7 +208,7 @@ def prepare_verified_anhir_b3(
     all_pngs = sorted(raw_dir.rglob("*.png"))
     ihc_files = [
         p for p in all_pngs
-        if _is_allowed_slide_path(str(p), allowed_subsets) and _detect_stain_name(p.stem) != "ANHIR_HE"
+        if _is_allowed_slide_path(str(p.relative_to(raw_dir)), allowed_subsets) and _detect_stain_name(p.stem) not in NON_IHC_STAINS
     ]
 
     if not ihc_files and user and password:
@@ -217,7 +218,7 @@ def prepare_verified_anhir_b3(
         all_pngs = sorted(raw_dir.rglob("*.png"))
         ihc_files = [
             p for p in all_pngs
-            if _is_allowed_slide_path(str(p), allowed_subsets) and _detect_stain_name(p.stem) != "ANHIR_HE"
+            if _is_allowed_slide_path(str(p.relative_to(raw_dir)), allowed_subsets) and _detect_stain_name(p.stem) not in NON_IHC_STAINS
         ]
 
     if not ihc_files:

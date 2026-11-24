@@ -90,8 +90,8 @@ def psnr_cbcr(ref: np.ndarray, rec: np.ndarray) -> float:
     cr2 = 0.500000 * r2 - 0.418688 * g2 - 0.081312 * b2
     mse = 0.5 * float(np.mean((cb1 - cb2) ** 2) + np.mean((cr1 - cr2) ** 2))
     if mse == 0.0:
-        return float("nan")
-    return float(10.0 * math.log10(255.0**2 / mse))
+        return 100.0
+    return min(100.0, float(10.0 * math.log10(255.0**2 / mse)))
 
 
 def extract_dab_od(tile: np.ndarray) -> np.ndarray:
@@ -104,16 +104,19 @@ def dab_psnr_and_dice(dab_ref: np.ndarray, rec: np.ndarray) -> tuple[float, floa
     dab_rec = extract_dab_od(rec)
     mse = float(np.mean((dab_ref - dab_rec) ** 2))
     if mse == 0.0:
-        psnr_val = float("nan")
+        psnr_val = 100.0
     else:
-        psnr_val = float(10.0 * math.log10(DAB_PEAK_OD**2 / mse))
+        psnr_val = min(100.0, float(10.0 * math.log10(DAB_PEAK_OD**2 / mse)))
 
-    # Feste physikalische Positivitaetsschwelle (OD >= 0.15, konsistent mit prepare_track_b3_anhir_ihc.py)
+    # Feste physikalische Positivitaetsschwelle (OD >= 0.15); Ausschluss leerer Kacheln strikt referenzbasiert
     m_ref = dab_ref >= 0.15
-    m_rec = dab_rec >= 0.15
-    inter = float(np.logical_and(m_ref, m_rec).sum())
-    tot = float(m_ref.sum() + m_rec.sum())
-    dice_val = (2.0 * inter / tot) if tot > 0.0 else float("nan")
+    if int(m_ref.sum()) == 0:
+        dice_val = float("nan")
+    else:
+        m_rec = dab_rec >= 0.15
+        inter = float(np.logical_and(m_ref, m_rec).sum())
+        tot = float(m_ref.sum() + m_rec.sum())
+        dice_val = 2.0 * inter / tot
     return psnr_val, dice_val
 
 
@@ -255,8 +258,6 @@ def run_track_b3(
         if not out_csv.exists():
             raise FileNotFoundError(f"Raw-CSV nicht gefunden: {out_csv}")
         df = pd.read_csv(out_csv)
-        df["chroma_mode"] = df["codec_or_model"].map(lambda x: CHROMA_MODES.get(str(x), "Other"))
-        df.to_csv(out_csv, index=False)
         _aggregate_and_save_b3(df, summary_csv, bdrate_csv, plot_path)
         return
 

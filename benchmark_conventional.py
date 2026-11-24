@@ -302,7 +302,7 @@ class CodecAVIF(Codec):
                 self._ic = imagecodecs
                 pf_enum = getattr(getattr(imagecodecs, "AVIF", None), "PIXEL_FORMAT", None)
                 enum_key = {"4:4:4": "YUV444", "4:2:2": "YUV422", "4:2:0": "YUV420"}.get(subsampling, "YUV444")
-                self._pixelformat = getattr(pf_enum, enum_key, subsampling.replace(":", ""))
+                self._pixelformat = getattr(pf_enum, enum_key, f"yuv{subsampling.replace(':', '')}")
         except ImportError:
             pass
 

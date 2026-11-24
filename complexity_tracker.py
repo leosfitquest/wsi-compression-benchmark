@@ -83,8 +83,14 @@ def count_macs_and_params(
             k_h, k_w = module.kernel_size
             c_in = module.in_channels
             groups = module.groups
-            macs = b * c_out * h_out * w_out * (c_in // groups) * k_h * k_w
+            if hasattr(module, "mask") and isinstance(module.mask, torch.Tensor) and module.mask.shape == module.weight.shape:
+                macs = b * h_out * w_out * int(module.mask.ne(0).sum().item())
+            else:
+                macs = b * c_out * h_out * w_out * (c_in // groups) * k_h * k_w
             macs_list.append(int(macs))
+        elif type(module).__name__ in ("GDN", "IGDN", "GDN1"):
+            b, c, h_out, w_out = out.shape
+            macs_list.append(int(b * h_out * w_out * c * c))
         elif isinstance(module, nn.ConvTranspose2d):
             # Jeder Eingangs-Pixel (H_in x W_in) wird mit dem Kernel (k_h x k_w) fuer C_out/groups multipliziert
             b, c_in, h_in, w_in = inp[0].shape
@@ -99,7 +105,7 @@ def count_macs_and_params(
 
     hooks = []
     for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)) or type(m).__name__ in ("GDN", "IGDN", "GDN1"):
             hooks.append(m.register_forward_hook(conv_hook))
 
     with torch.inference_mode():
