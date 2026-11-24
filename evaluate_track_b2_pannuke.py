@@ -71,7 +71,7 @@ class DeepFeatureExtractor:
     """
     Extrahiert L2-normierte Feature-Vektoren fuer Downstream-Feature-Drift:
     - `resnet50`: ResNet-50 (ImageNet-1K V2, 2048-D, nativ 256x256 -> lokaler CPU-Pilot)
-    - `uni`: MahmoodLab/UNI Pathology Foundation Model (ViT-L/16, 1024-D, 224x224 -> VUB GPU)
+    - `uni`: MahmoodLab/UNI Pathology Foundation Model (ViT-L/16, 1024-D, native 256x256 -> VUB GPU)
     - `phikon`: owkin/phikon Pathology Foundation Model (ViT-B/16, 768-D, 224x224 -> VUB GPU)
     """
 
@@ -101,7 +101,7 @@ class DeepFeatureExtractor:
                 from transformers import AutoModel
             except ImportError as exc:
                 raise ImportError("Fuer --backbone phikon bitte `pip install transformers` installieren.") from exc
-            self.model = AutoModel.from_pretrained("owkin/phikon").eval().to(device)
+            self.model = AutoModel.from_pretrained("owkin/phikon", add_pooling_layer=False).eval().to(device)
             self.resize_hw = (224, 224)
         else:
             raise ValueError(f"Unbekanntes Backbone '{backbone}'. Erlaubt: resnet50, uni, phikon.")
@@ -276,12 +276,12 @@ def fast_pq(inst_true: np.ndarray, inst_pred: np.ndarray) -> float:
 
 def psnr_masked(ref: np.ndarray, rec: np.ndarray, mask: np.ndarray) -> float:
     if not np.any(mask):
-        return psnr_rgb(ref, rec)
+        return float("nan")
     diff = ref[mask].astype(np.float64) - rec[mask].astype(np.float64)
     mse = float(np.mean(diff**2))
     if mse == 0.0:
-        return float("inf")
-    return float(10.0 * np.log10(255.0**2 / mse))
+        return 100.0
+    return min(100.0, float(10.0 * np.log10(255.0**2 / mse)))
 
 
 def run_track_b2(
@@ -341,6 +341,7 @@ def run_track_b2(
     ) -> B2ResultRow:
         _, organ, ref_tile, gt_5ch, f_ref, ref_inst, ref_class_insts = ref_cache[tid]
         nuc_mask = np.any(gt_5ch > 0, axis=-1)
+        p_nuc = psnr_masked(ref_tile, decoded, nuc_mask)
         f_rec = feat_extractor.embed(decoded)
         cos_sim = feat_extractor.cosine_sim(f_ref, f_rec)
 
@@ -365,7 +366,7 @@ def run_track_b2(
             within_tolerance=within_tol,
             psnr_db=round(psnr_rgb(ref_tile, decoded), 2),
             psnr_y_db=round(psnr_y(ref_tile, decoded), 2),
-            psnr_nuclei_db=round(psnr_masked(ref_tile, decoded, nuc_mask), 2),
+            psnr_nuclei_db=round(p_nuc, 2) if np.isfinite(p_nuc) else float("nan"),
             ms_ssim=round(ms_ssim_rgb(ref_tile, decoded), 4),
             feature_cos_sim=round(cos_sim, 5),
             dice_vs_ref=round(dice_val, 4),

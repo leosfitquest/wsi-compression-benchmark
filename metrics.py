@@ -47,8 +47,8 @@ def psnr_rgb(ref: U8Image, rec: U8Image) -> float:
     _check_pair(ref, rec)
     mse = float(np.mean((ref.astype(np.float64) - rec.astype(np.float64)) ** 2))
     if mse == 0.0:
-        return math.inf
-    return 10.0 * math.log10(255.0**2 / mse)
+        return 100.0
+    return min(100.0, 10.0 * math.log10(255.0**2 / mse))
 
 
 def psnr_y(ref: U8Image, rec: U8Image) -> float:
@@ -59,8 +59,8 @@ def psnr_y(ref: U8Image, rec: U8Image) -> float:
     y_rec = np.tensordot(rec.astype(np.float64), weights, axes=([2], [0]))
     mse = float(np.mean((y_ref - y_rec) ** 2))
     if mse == 0.0:
-        return math.inf
-    return 10.0 * math.log10(255.0**2 / mse)
+        return 100.0
+    return min(100.0, 10.0 * math.log10(255.0**2 / mse))
 
 
 def _gaussian_window(size: int, sigma: float) -> F64Array:
@@ -161,11 +161,11 @@ def lpips_rgb(ref: U8Image, rec: U8Image, net: str = "alex", device: str = "cpu"
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
     ref = rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
-    assert psnr_rgb(ref, ref) == math.inf
-    assert psnr_y(ref, ref) == math.inf
+    assert psnr_rgb(ref, ref) == 100.0
+    assert psnr_y(ref, ref) == 100.0
     assert abs(ms_ssim_rgb(ref, ref) - 1.0) < 1e-9
     noise = rng.integers(-5, 6, ref.shape)
     noisy = np.clip(ref.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    print("identical tiles : PSNR = inf, MS-SSIM = 1.0  (OK)")
+    print("identical tiles : PSNR = 100.0 dB (capped), MS-SSIM = 1.0  (OK)")
     print(f"+/-5 noise      : RGB-PSNR = {psnr_rgb(ref, noisy):.2f} dB, Y-PSNR = {psnr_y(ref, noisy):.2f} dB, MS-SSIM = {ms_ssim_rgb(ref, noisy):.4f}")
     print(f"2048 B @ 256x256: {bits_per_pixel(2048, 256, 256):.4f} bpp (expected 0.2500)")

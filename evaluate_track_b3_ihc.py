@@ -101,22 +101,20 @@ def extract_dab_od(tile: np.ndarray) -> np.ndarray:
 
 
 def dab_psnr_and_dice(dab_ref: np.ndarray, rec: np.ndarray) -> tuple[float, float]:
+    # Strikt referenzbasierter Ausschluss DAB-freier Haematoxylin-Kacheln (verhindert 100 dB-Spikes bei fokalen Markern)
+    m_ref = dab_ref >= 0.15
+    if int(m_ref.sum()) == 0:
+        return float("nan"), float("nan")
     dab_rec = extract_dab_od(rec)
     mse = float(np.mean((dab_ref - dab_rec) ** 2))
     if mse == 0.0:
         psnr_val = 100.0
     else:
         psnr_val = min(100.0, float(10.0 * math.log10(DAB_PEAK_OD**2 / mse)))
-
-    # Feste physikalische Positivitaetsschwelle (OD >= 0.15); Ausschluss leerer Kacheln strikt referenzbasiert
-    m_ref = dab_ref >= 0.15
-    if int(m_ref.sum()) == 0:
-        dice_val = float("nan")
-    else:
-        m_rec = dab_rec >= 0.15
-        inter = float(np.logical_and(m_ref, m_rec).sum())
-        tot = float(m_ref.sum() + m_rec.sum())
-        dice_val = 2.0 * inter / tot
+    m_rec = dab_rec >= 0.15
+    inter = float(np.logical_and(m_ref, m_rec).sum())
+    tot = float(m_ref.sum() + m_rec.sum())
+    dice_val = 2.0 * inter / tot
     return psnr_val, dice_val
 
 

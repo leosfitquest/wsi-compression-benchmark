@@ -494,26 +494,34 @@ def run_benchmark(
                             csv_file.flush()
                         print(_fmt_row(row))
         else:
-            work_items = []
-            for tile_id, tile in tiles:
-                pending = [
-                    (c.name, float(t))
-                    for c in codecs
-                    for t in targets
-                    if (tile_id, c.name, round(float(t), 4)) not in done_keys
-                ]
-                if pending:
-                    work_items.append((tile_id, tile, jxl_effort, pending))
+            import itertools
 
+            def _iter_work_items():
+                for tile_id, tile in tiles:
+                    pending = [
+                        (c.name, float(t))
+                        for c in codecs
+                        for t in targets
+                        if (tile_id, c.name, round(float(t), 4)) not in done_keys
+                    ]
+                    if pending:
+                        yield (tile_id, tile, jxl_effort, pending)
+
+            work_iter = _iter_work_items()
+            chunk_size = max(workers * 4, 32)
             with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
-                for tile_rows in pool.map(_process_single_tile, work_items):
-                    for row in tile_rows:
-                        rows.append(row)
-                        if writer is not None and csv_file is not None:
-                            writer.writerow(asdict(row))
-                        print(_fmt_row(row))
-                    if csv_file is not None:
-                        csv_file.flush()
+                while True:
+                    chunk = list(itertools.islice(work_iter, chunk_size))
+                    if not chunk:
+                        break
+                    for tile_rows in pool.map(_process_single_tile, chunk):
+                        for row in tile_rows:
+                            rows.append(row)
+                            if writer is not None and csv_file is not None:
+                                writer.writerow(asdict(row))
+                            print(_fmt_row(row))
+                        if csv_file is not None:
+                            csv_file.flush()
     finally:
         if csv_file is not None:
             csv_file.close()

@@ -19,6 +19,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import io
 import re
 import urllib.request
 from pathlib import Path
@@ -136,15 +137,19 @@ def _download_individual_anhir_pngs(
 
     rel_paths: list[str] = []
     seen: set[str] = set()
-    for token in re.findall(r"[A-Za-z0-9_\-/\.]+?\.png", csv_text):
-        clean = token.lstrip("/")
-        if clean.startswith("images/"):
-            clean = clean[len("images/"):]
-        if clean not in seen and _is_allowed_slide_path(clean, allowed_subsets):
-            if _detect_stain_name(Path(clean).stem) in NON_IHC_STAINS:
+    for row in csv.reader(io.StringIO(csv_text)):
+        for cell in row:
+            token = cell.strip()
+            if not token.lower().endswith(".png"):
                 continue
-            seen.add(clean)
-            rel_paths.append(clean)
+            clean = token.lstrip("/")
+            if clean.startswith("images/"):
+                clean = clean[len("images/"):]
+            if clean not in seen and _is_allowed_slide_path(clean, allowed_subsets):
+                if _detect_stain_name(Path(clean).stem) in NON_IHC_STAINS:
+                    continue
+                seen.add(clean)
+                rel_paths.append(clean)
 
     downloaded: list[Path] = []
     for rel in rel_paths:

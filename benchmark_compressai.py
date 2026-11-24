@@ -102,16 +102,24 @@ def estimate_rate(model: torch.nn.Module, x_padded: torch.Tensor, hw: tuple[int,
 
 
 @torch.inference_mode()
-def real_coding(model_cpu: torch.nn.Module, x_padded_cpu: torch.Tensor, hw: tuple[int, int]) -> tuple[int, torch.Tensor, float, float]:
-    """Actual rANS bitstream: returns (bytes, decoded tensor, encode s, decode s)."""
+def real_coding(model: torch.nn.Module, x_padded: torch.Tensor, hw: tuple[int, int]) -> tuple[int, torch.Tensor, float, float]:
+    """Actual rANS bitstream on model device (CPU or CUDA): returns (bytes, decoded tensor on CPU, encode s, decode s)."""
+    dev = next(model.parameters()).device
+    x_dev = x_padded.to(dev)
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
     t0 = time.perf_counter()
-    enc = model_cpu.compress(x_padded_cpu)
+    enc = model.compress(x_dev)
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
     t1 = time.perf_counter()
-    dec = model_cpu.decompress(enc["strings"], enc["shape"])
+    dec = model.decompress(enc["strings"], enc["shape"])
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
     t2 = time.perf_counter()
     num_bytes = sum(len(s) for per_latent in enc["strings"] for s in per_latent)
     h, w = hw
-    return num_bytes, dec["x_hat"][..., :h, :w], t1 - t0, t2 - t1
+    return num_bytes, dec["x_hat"][..., :h, :w].cpu(), t1 - t0, t2 - t1
 
 
 HEADER = (f"{'tile':<14} {'model':<22} {'q':>2} {'bpp_est':>8} {'bpp_real':>8} "
@@ -194,7 +202,7 @@ def run_benchmark(
                 if not pending_tiles:
                     continue
                 est_model = load_model(name, q, metric, device)
-                code_model = est_model if device.type == "cpu" else load_model(name, q, metric, cpu)
+                code_model = est_model  # Keep real_coding on active device (CPU/CUDA) for GPU acceleration on VUB IPC3
                 for tile_id, tile in pending_tiles:
                     x, hw = pad_to_multiple(tile_to_tensor(tile))
                     bpp_est, x_hat = estimate_rate(est_model, x.to(device), hw)
