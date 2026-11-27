@@ -36,10 +36,10 @@ import numpy as np
 import PIL
 from PIL import Image, features
 
-from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_y
+from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_yuv_channels
 from tiles import Tile, synthetic_tiles, tiles_from_dir
 
-DEFAULT_TARGETS_BPP: tuple[float, ...] = (0.12, 0.25, 0.50, 0.75, 1.00, 1.50)
+DEFAULT_TARGETS_BPP: tuple[float, ...] = (0.12, 0.25, 0.35, 0.50, 0.75, 1.00, 1.50)
 RATE_TOLERANCE = 0.15  # accepted relative deviation of achieved vs. target bpp
 
 
@@ -64,6 +64,8 @@ class Encoded:
 class ResultRow:
     tile_id: str
     codec: str
+    rate_mode: str
+    setting_id: str
     backend: str
     param_name: str
     param: float
@@ -72,6 +74,9 @@ class ResultRow:
     within_tolerance: bool
     psnr_db: float
     psnr_y_db: float
+    psnr_u_db: float
+    psnr_v_db: float
+    psnr_yuv_db: float
     ms_ssim: float
     enc_s: float
     dec_s: float
@@ -380,12 +385,12 @@ def match_target_bpp(
 def _fmt_row(r: ResultRow) -> str:
     ok = "yes" if r.within_tolerance else "NO"
     return (f"{r.tile_id:<14} {r.codec:<10} {r.param_name + '=' + format(r.param, 'g'):<16} "
-            f"{r.target_bpp:>6.2f} {r.bpp:>7.3f} {ok:>4} {r.psnr_db:>7.2f} {r.psnr_y_db:>7.2f} "
+            f"{r.target_bpp:>6.2f} {r.bpp:>7.3f} {ok:>4} {r.psnr_db:>7.2f} {r.psnr_y_db:>7.2f} {r.psnr_yuv_db:>8.2f} "
             f"{r.ms_ssim:>8.4f} {1e3 * r.enc_s:>7.1f} {1e3 * r.dec_s:>7.1f}  {r.backend}")
 
 
 HEADER = (f"{'tile':<14} {'codec':<10} {'param':<16} {'target':>6} {'bpp':>7} {'ok':>4} "
-          f"{'PSNR':>7} {'Y-PSNR':>7} {'MS-SSIM':>8} {'enc ms':>7} {'dec ms':>7}  backend")
+          f"{'PSNR':>7} {'Y-PSNR':>7} {'YUV-PSNR':>8} {'MS-SSIM':>8} {'enc ms':>7} {'dec ms':>7}  backend")
 
 
 def _load_completed_keys(out_path: Path) -> set[tuple[str, str, float]]:
@@ -420,14 +425,16 @@ def _process_single_tile(
         except (CodecUnavailableError, RateControlError):
             continue
         bpp = bits_per_pixel(enc.num_bytes, h, w)
+        py, pu, pv, pyuv = psnr_yuv_channels(tile, enc.decoded)
         tile_rows.append(
             ResultRow(
-                tile_id=tile_id, codec=codec.name, backend=enc.backend,
+                tile_id=tile_id, codec=codec.name, rate_mode="bisect",
+                setting_id=f"target_{target:.2f}", backend=enc.backend,
                 param_name=codec.param_name, param=round(param, 4),
                 target_bpp=target, bpp=bpp,
                 within_tolerance=abs(bpp - target) / target <= RATE_TOLERANCE,
                 psnr_db=psnr_rgb(tile, enc.decoded),
-                psnr_y_db=psnr_y(tile, enc.decoded),
+                psnr_y_db=py, psnr_u_db=pu, psnr_v_db=pv, psnr_yuv_db=pyuv,
                 ms_ssim=ms_ssim_rgb(tile, enc.decoded),
                 enc_s=enc.enc_s, dec_s=enc.dec_s,
             )
@@ -478,13 +485,15 @@ def run_benchmark(
                             print(f"[skip] {codec.name} @ {target} bpp on {tile_id}: {exc}")
                             continue
                         bpp = bits_per_pixel(enc.num_bytes, h, w)
+                        py, pu, pv, pyuv = psnr_yuv_channels(tile, enc.decoded)
                         row = ResultRow(
-                            tile_id=tile_id, codec=codec.name, backend=enc.backend,
+                            tile_id=tile_id, codec=codec.name, rate_mode="bisect",
+                            setting_id=f"target_{target:.2f}", backend=enc.backend,
                             param_name=codec.param_name, param=round(param, 4),
                             target_bpp=target, bpp=bpp,
                             within_tolerance=abs(bpp - target) / target <= RATE_TOLERANCE,
                             psnr_db=psnr_rgb(tile, enc.decoded),
-                            psnr_y_db=psnr_y(tile, enc.decoded),
+                            psnr_y_db=py, psnr_u_db=pu, psnr_v_db=pv, psnr_yuv_db=pyuv,
                             ms_ssim=ms_ssim_rgb(tile, enc.decoded),
                             enc_s=enc.enc_s, dec_s=enc.dec_s,
                         )

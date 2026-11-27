@@ -1,14 +1,14 @@
-﻿"""
+"""
 metrics.py
 ----------
-Rate and distortion metrics shared by every codec benchmark in this folder.
+Rate and distortion metrics shared by every codec benchmark in this repository.
 
-All functions take uint8 RGB arrays of shape (H, W, 3). Conventional and learned
-codecs are therefore scored by exactly the same code, which is what makes their
-rate-distortion curves comparable.
+All distortion functions take uint8 RGB arrays of shape (H, W, 3) and follow
+ISO/IEC JPEG AI CTC v8.0 / JVET CTC ITU-R BT.709 Full-Range (0..255) in float64
+without intermediate uint8 rounding (peak 255.0, capped at 100.0 dB).
 
-Core metrics (bits_per_pixel, psnr_rgb, psnr_y, ms_ssim_rgb) depend on numpy only.
-lpips_rgb loads torch/lpips lazily on demand. Run `python metrics.py` for a quick self-test.
+Also provides lossless 8-bit RGB <-> 10-bit Full-Range BT.709 YUV444p10le
+conversion helpers for HM / VTM All-Intra reference encoders.
 """
 
 from __future__ import annotations
@@ -20,7 +20,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 U8Image = NDArray[np.uint8]
+U16Array = NDArray[np.uint16]
 F64Array = NDArray[np.float64]
+
+# ITU-R BT.709 luma coefficients
+BT709_KR: float = 0.2126
+BT709_KG: float = 0.7152
+BT709_KB: float = 0.0722
+PSNR_CAP_DB: float = 100.0
 
 # Wang, Simoncelli & Bovik (2003), "Multi-scale structural similarity for image quality assessment".
 MS_SSIM_WEIGHTS: tuple[float, ...] = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
@@ -37,30 +44,92 @@ def _check_pair(ref: U8Image, rec: U8Image) -> None:
         raise TypeError("Expected uint8 arrays (8-bit RGB).")
 
 
+def _mse_to_psnr(mse: float, peak: float = 255.0) -> float:
+    if mse <= 0.0:
+        return PSNR_CAP_DB
+    return min(PSNR_CAP_DB, 10.0 * math.log10(peak**2 / mse))
+
+
 def bits_per_pixel(num_bytes: int, height: int, width: int) -> float:
     """Rate: total compressed bits divided by the pixel count of the ORIGINAL tile."""
     return num_bytes * 8.0 / float(height * width)
 
 
 def psnr_rgb(ref: U8Image, rec: U8Image) -> float:
-    """PSNR in dB, MSE pooled over all three RGB channels, peak value 255."""
+    """PSNR in dB, MSE pooled over all three RGB channels, peak 255, capped at 100 dB."""
     _check_pair(ref, rec)
     mse = float(np.mean((ref.astype(np.float64) - rec.astype(np.float64)) ** 2))
-    if mse == 0.0:
-        return 100.0
-    return min(100.0, 10.0 * math.log10(255.0**2 / mse))
+    return _mse_to_psnr(mse)
+
+
+def rgb_to_yuv_bt709_f64(img: U8Image) -> tuple[F64Array, F64Array, F64Array]:
+    """ITU-R BT.709 Full-Range (0..255) conversion in float64 without intermediate rounding."""
+    rgb = img.astype(np.float64)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y = BT709_KR * r + BT709_KG * g + BT709_KB * b
+    u = (0.5 / (1.0 - BT709_KB)) * (b - y) + 128.0
+    v = (0.5 / (1.0 - BT709_KR)) * (r - y) + 128.0
+    return y, u, v
+
+
+def psnr_yuv_channels(ref: U8Image, rec: U8Image) -> tuple[float, float, float, float]:
+    """Returns (Y-PSNR, U-PSNR, V-PSNR, 6:1:1 weighted YUV-PSNR) in BT.709 Full-Range."""
+    _check_pair(ref, rec)
+    y_ref, u_ref, v_ref = rgb_to_yuv_bt709_f64(ref)
+    y_rec, u_rec, v_rec = rgb_to_yuv_bt709_f64(rec)
+    py = _mse_to_psnr(float(np.mean((y_ref - y_rec) ** 2)))
+    pu = _mse_to_psnr(float(np.mean((u_ref - u_rec) ** 2)))
+    pv = _mse_to_psnr(float(np.mean((v_ref - v_rec) ** 2)))
+    pyuv = (6.0 * py + pu + pv) / 8.0
+    return py, pu, pv, pyuv
 
 
 def psnr_y(ref: U8Image, rec: U8Image) -> float:
-    """Luminance PSNR in dB (ITU-R BT.601 Y-channel: 0.299 R + 0.587 G + 0.114 B)."""
+    """Luminance PSNR in dB (ITU-R BT.709 Full-Range Y-channel, capped at 100 dB)."""
+    py, _, _, _ = psnr_yuv_channels(ref, rec)
+    return py
+
+
+def psnr_yuv(ref: U8Image, rec: U8Image) -> float:
+    """Weighted 6:1:1 YUV-PSNR in dB (ITU-R BT.709 Full-Range, JVET / JPEG AI CTC)."""
+    _, _, _, pyuv = psnr_yuv_channels(ref, rec)
+    return pyuv
+
+
+def psnr_chroma_bt709(ref: U8Image, rec: U8Image) -> float:
+    """Pooled chrominance PSNR in dB over ITU-R BT.709 Full-Range U and V channels."""
     _check_pair(ref, rec)
-    weights = np.array([0.299, 0.587, 0.114], dtype=np.float64)
-    y_ref = np.tensordot(ref.astype(np.float64), weights, axes=([2], [0]))
-    y_rec = np.tensordot(rec.astype(np.float64), weights, axes=([2], [0]))
-    mse = float(np.mean((y_ref - y_rec) ** 2))
-    if mse == 0.0:
-        return 100.0
-    return min(100.0, 10.0 * math.log10(255.0**2 / mse))
+    _, u_ref, v_ref = rgb_to_yuv_bt709_f64(ref)
+    _, u_rec, v_rec = rgb_to_yuv_bt709_f64(rec)
+    mse = 0.5 * (float(np.mean((u_ref - u_rec) ** 2)) + float(np.mean((v_ref - v_rec) ** 2)))
+    return _mse_to_psnr(mse)
+
+
+def rgb_to_yuv444p10le(img: U8Image) -> U16Array:
+    """Convert uint8 RGB (H, W, 3) to planar uint16 BT.709 Full-Range 10-bit YUV444 (3, H, W) in [0, 1023]."""
+    if img.ndim != 3 or img.shape[2] != 3 or img.dtype != np.uint8:
+        raise ValueError(f"Expected uint8 RGB (H, W, 3), got {img.shape} {img.dtype}")
+    rgb = img.astype(np.float64) * (1023.0 / 255.0)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y = BT709_KR * r + BT709_KG * g + BT709_KB * b
+    u = (0.5 / (1.0 - BT709_KB)) * (b - y) + 512.0
+    v = (0.5 / (1.0 - BT709_KR)) * (r - y) + 512.0
+    yuv = np.stack([y, u, v], axis=0)
+    return np.clip(np.rint(yuv), 0, 1023).astype(np.uint16)
+
+
+def yuv444p10le_to_rgb(yuv: U16Array) -> U8Image:
+    """Convert planar uint16 BT.709 Full-Range 10-bit YUV444 (3, H, W) back to uint8 RGB (H, W, 3)."""
+    if yuv.ndim != 3 or yuv.shape[0] != 3:
+        raise ValueError(f"Expected planar YUV (3, H, W), got {yuv.shape}")
+    y = yuv[0].astype(np.float64)
+    u = yuv[1].astype(np.float64) - 512.0
+    v = yuv[2].astype(np.float64) - 512.0
+    r = y + (2.0 * (1.0 - BT709_KR)) * v
+    b = y + (2.0 * (1.0 - BT709_KB)) * u
+    g = (y - BT709_KR * r - BT709_KB * b) / BT709_KG
+    rgb = np.stack([r, g, b], axis=-1) * (255.0 / 1023.0)
+    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
 
 
 def _gaussian_window(size: int, sigma: float) -> F64Array:
@@ -135,11 +204,7 @@ def ms_ssim_rgb(
 
 
 def lpips_rgb(ref: U8Image, rec: U8Image, net: str = "alex", device: str = "cpu") -> float:
-    """Learned Perceptual Image Patch Similarity (Zhang et al., CVPR 2018; lower is better).
-
-    Lazy-loads `lpips` and caches the network weights per (net, device).
-    Install on GPU cluster or locally via: `pip install lpips`.
-    """
+    """Learned Perceptual Image Patch Similarity (Zhang et al., CVPR 2018; lower is better)."""
     _check_pair(ref, rec)
     import torch
     import lpips  # type: ignore[import-untyped]
@@ -150,7 +215,6 @@ def lpips_rgb(ref: U8Image, rec: U8Image, net: str = "alex", device: str = "cpu"
         _LPIPS_CACHE[key] = loss_fn
     loss_fn = _LPIPS_CACHE[key]
 
-    # Convert uint8 [0, 255] -> float32 [-1.0, +1.0] of shape (1, 3, H, W)
     t_ref = torch.from_numpy(ref).permute(2, 0, 1).unsqueeze(0).float().div(127.5).sub(1.0).to(device)
     t_rec = torch.from_numpy(rec).permute(2, 0, 1).unsqueeze(0).float().div(127.5).sub(1.0).to(device)
     with torch.inference_mode():
@@ -162,10 +226,14 @@ if __name__ == "__main__":
     rng = np.random.default_rng(0)
     ref = rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
     assert psnr_rgb(ref, ref) == 100.0
-    assert psnr_y(ref, ref) == 100.0
+    assert psnr_yuv_channels(ref, ref) == (100.0, 100.0, 100.0, 100.0)
+    assert psnr_chroma_bt709(ref, ref) == 100.0
     assert abs(ms_ssim_rgb(ref, ref) - 1.0) < 1e-9
+    rec_10bit = yuv444p10le_to_rgb(rgb_to_yuv444p10le(ref))
+    assert np.array_equal(ref, rec_10bit), "10-bit BT.709 Full-Range roundtrip must be lossless!"
     noise = rng.integers(-5, 6, ref.shape)
     noisy = np.clip(ref.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-    print("identical tiles : PSNR = 100.0 dB (capped), MS-SSIM = 1.0  (OK)")
-    print(f"+/-5 noise      : RGB-PSNR = {psnr_rgb(ref, noisy):.2f} dB, Y-PSNR = {psnr_y(ref, noisy):.2f} dB, MS-SSIM = {ms_ssim_rgb(ref, noisy):.4f}")
+    py, pu, pv, pyuv = psnr_yuv_channels(ref, noisy)
+    print("identical tiles : RGB/Y/U/V/YUV-PSNR = 100.0 dB (capped), MS-SSIM = 1.0, 10-bit roundtrip = lossless (OK)")
+    print(f"+/-5 noise      : RGB={psnr_rgb(ref, noisy):.2f} dB, Y={py:.2f}, U={pu:.2f}, V={pv:.2f}, YUV(6:1:1)={pyuv:.2f} dB, MS-SSIM={ms_ssim_rgb(ref, noisy):.4f}")
     print(f"2048 B @ 256x256: {bits_per_pixel(2048, 256, 256):.4f} bpp (expected 0.2500)")

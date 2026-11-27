@@ -30,7 +30,7 @@ try:
 except ImportError as exc:
     sys.exit(f"Missing dependency '{exc.name}'. Install with: pip install torch torchvision compressai")
 
-from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_y
+from metrics import bits_per_pixel, ms_ssim_rgb, psnr_rgb, psnr_yuv_channels
 from tiles import Tile, synthetic_tiles, tiles_from_dir
 
 QUALITY_RANGES: dict[str, tuple[int, int]] = {
@@ -46,12 +46,17 @@ PAD_MULTIPLE = 64
 class ResultRow:
     tile_id: str
     model: str
+    rate_mode: str
+    setting_id: str
     quality: int
     est_device: str
     bpp_est: float
     bpp_real: float | None
     psnr_db: float
     psnr_y_db: float
+    psnr_u_db: float
+    psnr_v_db: float
+    psnr_yuv_db: float
     ms_ssim: float
     enc_s: float | None
     dec_s: float | None
@@ -123,7 +128,7 @@ def real_coding(model: torch.nn.Module, x_padded: torch.Tensor, hw: tuple[int, i
 
 
 HEADER = (f"{'tile':<14} {'model':<22} {'q':>2} {'bpp_est':>8} {'bpp_real':>8} "
-          f"{'PSNR':>7} {'Y-PSNR':>7} {'MS-SSIM':>8} {'enc s':>7} {'dec s':>7}")
+          f"{'PSNR':>7} {'Y-PSNR':>7} {'YUV-PSNR':>8} {'MS-SSIM':>8} {'enc s':>7} {'dec s':>7}")
 
 
 def _fmt_row(r: ResultRow) -> str:
@@ -131,7 +136,7 @@ def _fmt_row(r: ResultRow) -> str:
     enc = f"{r.enc_s:>7.3f}" if r.enc_s is not None else f"{'-':>7}"
     dec = f"{r.dec_s:>7.3f}" if r.dec_s is not None else f"{'-':>7}"
     return (f"{r.tile_id:<14} {r.model:<22} {r.quality:>2} {r.bpp_est:>8.4f} {real} "
-            f"{r.psnr_db:>7.2f} {r.psnr_y_db:>7.2f} {r.ms_ssim:>8.4f} {enc} {dec}")
+            f"{r.psnr_db:>7.2f} {r.psnr_y_db:>7.2f} {r.psnr_yuv_db:>8.2f} {r.ms_ssim:>8.4f} {enc} {dec}")
 
 
 def _load_completed_keys(out_path: Path) -> set[tuple[str, str, int]]:
@@ -169,7 +174,12 @@ def run_benchmark(
     out_path: Path | None = None,
     resume: bool = True,
 ) -> list[ResultRow]:
-    cpu = torch.device("cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
     tile_list = list(tiles)
     rows: list[ResultRow] = []
 
@@ -188,7 +198,7 @@ def run_benchmark(
             writer.writeheader()
             csv_file.flush()
 
-    print(f"estimation device: {device} | entropy coding device: cpu | tiles: {len(tile_list)}")
+    print(f"estimation device: {device} | entropy coding device: {device} | tiles: {len(tile_list)}")
     print(HEADER)
     print("-" * len(HEADER))
     try:
@@ -211,9 +221,15 @@ def run_benchmark(
                         num_bytes, x_hat, enc_s, dec_s = real_coding(code_model, x, hw)
                         bpp_real = bits_per_pixel(num_bytes, *hw)
                     rec = tensor_to_tile(x_hat)
+                    p_rgb = psnr_rgb(tile, rec)
+                    if do_real_coding and p_rgb < 12.0:
+                        raise RuntimeError(f"Potential GPU rANS desync on {tile_id} ({name} q={q}): RGB-PSNR={p_rgb:.2f} dB")
+                    py, pu, pv, pyuv = psnr_yuv_channels(tile, rec)
                     row = ResultRow(
-                        tile_id, name, q, device.type, bpp_est, bpp_real,
-                        psnr_rgb(tile, rec), psnr_y(tile, rec), ms_ssim_rgb(tile, rec), enc_s, dec_s
+                        tile_id=tile_id, model=name, rate_mode="neural_q", setting_id=f"q_{q}",
+                        quality=q, est_device=device.type, bpp_est=bpp_est, bpp_real=bpp_real,
+                        psnr_db=p_rgb, psnr_y_db=py, psnr_u_db=pu, psnr_v_db=pv, psnr_yuv_db=pyuv,
+                        ms_ssim=ms_ssim_rgb(tile, rec), enc_s=enc_s, dec_s=dec_s,
                     )
                     rows.append(row)
                     if writer is not None and csv_file is not None:
