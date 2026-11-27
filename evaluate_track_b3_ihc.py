@@ -351,18 +351,18 @@ def run_track_b3(
             chroma_mode=CHROMA_MODES.get(name, "Other"),
             setting=round(setting, 4),
             target_bpp=target_bpp,
-            bpp=round(bpp, 4),
+            bpp=float(bpp),
             within_tolerance=within_tol,
-            psnr_rgb_db=round(p_rgb, 2),
-            psnr_y_db=round(py, 2),
-            psnr_u_db=round(pu, 2),
-            psnr_v_db=round(pv, 2),
-            psnr_yuv_db=round(pyuv, 2),
-            psnr_chroma_db=round(p_chr, 2),
-            psnr_dab_db=round(p_dab, 2) if np.isfinite(p_dab) else float("nan"),
-            dab_dice=round(d_dice, 4) if np.isfinite(d_dice) else float("nan"),
-            cie_delta_e=round(de_val, 3),
-            ms_ssim=round(ms_ssim_rgb(ref_tile, decoded), 4),
+            psnr_rgb_db=float(p_rgb),
+            psnr_y_db=float(py),
+            psnr_u_db=float(pu),
+            psnr_v_db=float(pv),
+            psnr_yuv_db=float(pyuv),
+            psnr_chroma_db=float(p_chr),
+            psnr_dab_db=float(p_dab) if np.isfinite(p_dab) else float("nan"),
+            dab_dice=float(d_dice) if np.isfinite(d_dice) else float("nan"),
+            cie_delta_e=float(de_val),
+            ms_ssim=float(ms_ssim_rgb(ref_tile, decoded)),
         )
 
     print("[1/2] Evaluierung der 6 konventionellen Codecs (inkl. 0.35 bpp, 4:4:4 vs. 4:2:0 vs. XYB)...")
@@ -426,11 +426,12 @@ def _plot_track_b3(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
         "VTM All-Intra":        {"color": "#1b9e77", "marker": "*", "label": "VTM All-Intra (VVC 4:4:4)", "linestyle": "-."},
         "JPEG AI VM (BOP)":     {"color": "#e377c2", "marker": "H", "label": "JPEG AI VM (BOP)", "linestyle": "--"},
         "MLIC++":               {"color": "#000000", "marker": "h", "label": "MLIC++", "linestyle": "--"},
-        "bmshj2018-hyperprior": {"color": "#ff7f0e", "marker": "o", "label": "Hyperprior (Ball? 2018)", "linestyle": "--"},
+        "bmshj2018-hyperprior": {"color": "#ff7f0e", "marker": "o", "label": "Hyperprior (Ball\u00e9 2018)", "linestyle": "--"},
         "cheng2020-attn":       {"color": "#d62728", "marker": "v", "label": "Cheng2020-Attention", "linestyle": "--"},
     }
 
     max_bpp = float(sum_df["Mean bpp"].max())
+    legend_cols = 2 if sum_df["Codec / Model"].nunique() > 8 else 1
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(19.5, 6.0), dpi=300)
     for name, grp in sum_df.groupby("Codec / Model"):
         grp = grp.sort_values("Mean bpp")
@@ -446,15 +447,15 @@ def _plot_track_b3(sum_df: pd.DataFrame, n_tiles: int, plot_path: Path) -> None:
 
     ax1.set_title("Chroma Subsampling Impact: CbCr-PSNR", fontsize=12, fontweight="bold")
     ax1.set_ylabel("Chroma CbCr-PSNR (BT.709) [dB]", fontsize=11)
-    ax1.legend(loc="lower right", fontsize=8.5, framealpha=0.92)
+    ax1.legend(loc="lower right", fontsize=8.0, framealpha=0.92, ncol=legend_cols)
 
     ax2.set_title("IHC Deconvolution Fidelity: DAB-Stain-PSNR", fontsize=12, fontweight="bold")
     ax2.set_ylabel("Ruifrok DAB Optical Density PSNR [dB]", fontsize=11)
-    ax2.legend(loc="lower right", fontsize=8.5, framealpha=0.92)
+    ax2.legend(loc="lower right", fontsize=8.0, framealpha=0.92, ncol=legend_cols)
 
     ax3.set_title("Perceptual Color Error: CIE Delta-E (lower = better)", fontsize=12, fontweight="bold")
     ax3.set_ylabel("Mean CIE Delta-E (L*a*b*)", fontsize=11)
-    ax3.legend(loc="upper right", fontsize=8.5, framealpha=0.92)
+    ax3.legend(loc="upper right", fontsize=8.0, framealpha=0.92, ncol=legend_cols)
 
     fig.suptitle(f"Curated Track B3: IHC / DAB Color & Chroma-Subsampling Stress Test (n={n_tiles} Lossless Tiles)", fontsize=13.5, y=0.995)
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])

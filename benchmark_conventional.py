@@ -397,12 +397,19 @@ def _load_completed_keys(out_path: Path) -> set[tuple[str, str, float]]:
     done: set[tuple[str, str, float]] = set()
     if not out_path.exists() or out_path.stat().st_size == 0:
         return done
-    try:
-        with out_path.open("r", newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
+    expected_cols = [fl.name for fl in fields(ResultRow)]
+    with out_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != expected_cols:
+            raise ValueError(
+                f"CSV schema mismatch in {out_path}: found {reader.fieldnames}, expected {expected_cols}. "
+                "Use a new --out path or pass --no-resume to overwrite."
+            )
+        for row in reader:
+            try:
                 done.add((row["tile_id"], row["codec"], round(float(row["target_bpp"]), 4)))
-    except Exception:
-        pass
+            except (KeyError, TypeError, ValueError):
+                continue
     return done
 
 

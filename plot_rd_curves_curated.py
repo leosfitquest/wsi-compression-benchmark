@@ -20,7 +20,7 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from bdrate_summary import build_curves_from_df, load_codec_csvs, load_unified_manifest
+from bdrate_summary import build_curves_from_df, load_codec_csvs, load_unified_manifest, pair_codec_df
 
 CODEC_STYLES: dict[str, dict[str, object]] = {
     "AVIF":                 {"color": "#9467bd", "marker": "D", "label": "AVIF (libavif, 4:4:4)", "linestyle": "-"},
@@ -33,7 +33,7 @@ CODEC_STYLES: dict[str, dict[str, object]] = {
     "VTM All-Intra":        {"color": "#1b9e77", "marker": "*", "label": "VTM All-Intra (VVC 4:4:4)", "linestyle": "-."},
     "JPEG AI VM (BOP)":     {"color": "#e377c2", "marker": "H", "label": "JPEG AI VM (BOP)", "linestyle": "--"},
     "MLIC++":               {"color": "#000000", "marker": "h", "label": "MLIC++ (Neural)", "linestyle": "--"},
-    "bmshj2018-hyperprior": {"color": "#ff7f0e", "marker": "o", "label": "Hyperprior (Ball? 2018)", "linestyle": "--"},
+    "bmshj2018-hyperprior": {"color": "#ff7f0e", "marker": "o", "label": "Hyperprior (Ball\u00e9 2018)", "linestyle": "--"},
     "cheng2020-attn":       {"color": "#d62728", "marker": "v", "label": "Cheng2020-Attention", "linestyle": "--"},
 }
 
@@ -114,9 +114,9 @@ def plot_s1_vs_s2(df_all: pd.DataFrame, mf: pd.DataFrame, out_file: Path) -> Non
             ax.grid(True, linestyle=":", alpha=0.6)
             ax.set_xlabel("Bitrate [bpp]", fontsize=10.5)
             ax.legend(loc="lower right", fontsize=8.0, framealpha=0.92)
-        ax_psnr.set_title(f"{label_str} ? RGB-PSNR", fontsize=11.5, fontweight="bold")
+        ax_psnr.set_title(f"{label_str} - RGB-PSNR", fontsize=11.5, fontweight="bold")
         ax_psnr.set_ylabel("RGB-PSNR [dB]", fontsize=10.5)
-        ax_ssim.set_title(f"{label_str} ? MS-SSIM", fontsize=11.5, fontweight="bold")
+        ax_ssim.set_title(f"{label_str} - MS-SSIM", fontsize=11.5, fontweight="bold")
         ax_ssim.set_ylabel("MS-SSIM", fontsize=10.5)
 
     n_paired = len(s1_ids & set(df_all["tile_id"])) + len(s2_ids & set(df_all["tile_id"]))
@@ -137,32 +137,38 @@ def plot_unified_suite(csv_paths: Sequence[Path], manifest_csv: Path, out_dir: P
     if joined.empty:
         raise ValueError("Manifest join yielded 0 rows.")
 
-    tile_meta = joined[["tile_id", "gt_type"]].drop_duplicates()
+    # 1. Overall (strictly paired BEFORE counting n_lossless / n_lossy)
+    paired_all = pair_codec_df(joined, strict_pairing=True)
+    tile_meta = paired_all[["tile_id", "gt_type"]].drop_duplicates()
     n_ll = int((tile_meta["gt_type"] == "lossless").sum())
     n_lo = int((tile_meta["gt_type"] == "lossy").sum())
-
-    # 1. Overall
     plot_curves_panel(
-        build_curves_from_df(joined, strict_pairing=True),
+        build_curves_from_df(paired_all, strict_pairing=False),
         f"Track A Overall R-D (Tile-Pooled, n_lossless={n_ll}, n_lossy={n_lo})",
         out_dir / "rd_curves_overall.png",
     )
 
     # 2. Lossless vs. Lossy
     for gt_type, grp in joined.groupby("gt_type", sort=True):
-        n_t = int(grp["tile_id"].nunique())
+        paired_grp = pair_codec_df(grp, strict_pairing=True)
+        if paired_grp.empty:
+            continue
+        n_t = int(paired_grp["tile_id"].nunique())
         plot_curves_panel(
-            build_curves_from_df(grp, strict_pairing=True),
+            build_curves_from_df(paired_grp, strict_pairing=False),
             f"Track A R-D: Ground-Truth = {gt_type} (Paired n={n_t} Tiles)",
             out_dir / f"rd_curves_gt_{gt_type}.png",
         )
 
     # 3. Organ & Stain
     for (gt_type, organ, stain), grp in joined.groupby(["gt_type", "organ", "stain"], sort=True):
-        n_t = int(grp["tile_id"].nunique())
+        paired_grp = pair_codec_df(grp, strict_pairing=True)
+        if paired_grp.empty:
+            continue
+        n_t = int(paired_grp["tile_id"].nunique())
         slug = f"{gt_type}_{organ}_{stain}".lower().replace("&", "").replace(" ", "_").replace("/", "_")
         plot_curves_panel(
-            build_curves_from_df(grp, strict_pairing=True),
+            build_curves_from_df(paired_grp, strict_pairing=False),
             f"Track A R-D: {organ} | {stain} ({gt_type}, Paired n={n_t} Tiles)",
             out_dir / f"rd_curves_stratum_{slug}.png",
         )

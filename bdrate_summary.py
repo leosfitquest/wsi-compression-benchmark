@@ -264,14 +264,15 @@ def load_codec_csvs(csv_paths: Sequence[Path]) -> pd.DataFrame:
 
         df["target_bpp"] = pd.to_numeric(raw["target_bpp"], errors="coerce") if "target_bpp" in raw.columns else np.nan
 
-        if "bpp_real" in raw.columns and raw["bpp_real"].notna().any():
-            df["bpp"] = pd.to_numeric(raw["bpp_real"], errors="coerce")
-        elif "bpp" in raw.columns:
-            df["bpp"] = pd.to_numeric(raw["bpp"], errors="coerce")
-        elif "bpp_est" in raw.columns:
-            df["bpp"] = pd.to_numeric(raw["bpp_est"], errors="coerce")
-        else:
+        bpp_series = pd.Series(np.nan, index=raw.index, dtype=np.float64)
+        found_bpp_col = False
+        for col in ("bpp_real", "bpp", "bpp_est"):
+            if col in raw.columns:
+                found_bpp_col = True
+                bpp_series = bpp_series.combine_first(pd.to_numeric(raw[col], errors="coerce"))
+        if not found_bpp_col:
             raise ValueError(f"Missing bpp column in {p}")
+        df["bpp"] = bpp_series
 
         if "within_tolerance" in raw.columns:
             df["within_tolerance"] = raw["within_tolerance"].astype(bool)
@@ -292,6 +293,31 @@ def load_codec_csvs(csv_paths: Sequence[Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def pair_codec_df(
+    df: pd.DataFrame,
+    allowed_tiles: set[str] | None = None,
+    strict_pairing: bool = True,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Filters DataFrame to `allowed_tiles` and intersects tile_ids across all codecs when `strict_pairing=True`."""
+    if df.empty:
+        return df.copy()
+    work = df[df["tile_id"].isin(allowed_tiles)].copy() if allowed_tiles is not None else df.copy()
+    if work.empty or not strict_pairing:
+        return work
+    codec_tile_sets = {
+        str(codec): set(grp["tile_id"].unique()) for codec, grp in work.groupby("codec")
+    }
+    if len(codec_tile_sets) > 1:
+        shared_tiles = set.intersection(*codec_tile_sets.values())
+        if verbose:
+            for codec, tset in codec_tile_sets.items():
+                if len(tset) != len(shared_tiles):
+                    print(f"[warn] Stratum tile-set pairing: {codec} had {len(tset)} tiles, intersecting to {len(shared_tiles)} shared tiles.")
+        work = work[work["tile_id"].isin(shared_tiles)].copy()
+    return work
+
+
 def build_curves_from_df(
     df: pd.DataFrame,
     allowed_tiles: set[str] | None = None,
@@ -299,26 +325,9 @@ def build_curves_from_df(
     strict_pairing: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Aggregates normalized codec rows into per-codec R-D curves respecting `rate_mode`."""
-    if df.empty:
-        return {}
-    work = df.copy()
-    if allowed_tiles is not None:
-        work = work[work["tile_id"].isin(allowed_tiles)].copy()
+    work = pair_codec_df(df, allowed_tiles=allowed_tiles, strict_pairing=strict_pairing)
     if work.empty:
         return {}
-
-    if strict_pairing:
-        codec_tile_sets = {
-            str(codec): set(grp["tile_id"].unique()) for codec, grp in work.groupby("codec")
-        }
-        if len(codec_tile_sets) > 1:
-            shared_tiles = set.intersection(*codec_tile_sets.values())
-            for codec, tset in codec_tile_sets.items():
-                if len(tset) != len(shared_tiles):
-                    print(f"[warn] Stratum tile-set pairing: {codec} had {len(tset)} tiles, intersecting to {len(shared_tiles)} shared tiles.")
-            work = work[work["tile_id"].isin(shared_tiles)].copy()
-            if work.empty:
-                return {}
 
     metric_cols = ["bpp", "psnr_db", "ms_ssim"]
     for opt in ("psnr_y_db", "psnr_u_db", "psnr_v_db", "psnr_yuv_db"):
@@ -513,11 +522,14 @@ def evaluate_unified_benchmark(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # (3) Per (gt_type, organ, stain) breakdown
+    # (3) Per (gt_type, organ, stain) breakdown (strictly paired BEFORE counting N_Tiles)
     stratum_tables: list[pd.DataFrame] = []
     for (gt_type, organ, stain), sgrp in joined.groupby(["gt_type", "organ", "stain"], sort=True):
-        n_t = int(sgrp["tile_id"].nunique())
-        curves = build_curves_from_df(sgrp, strict_pairing=True)
+        paired_sgrp = pair_codec_df(sgrp, strict_pairing=True)
+        if paired_sgrp.empty:
+            continue
+        n_t = int(paired_sgrp["tile_id"].nunique())
+        curves = build_curves_from_df(paired_sgrp, strict_pairing=False)
         tbl = score_curves_table(f"{gt_type} | {organ} | {stain} (n={n_t})", curves, anchor=anchor)
         if tbl is not None:
             tbl.insert(1, "gt_type", str(gt_type))
@@ -532,11 +544,14 @@ def evaluate_unified_benchmark(
         print("\n=== (3) R-D by Organ & Stain (Akima) ===")
         print(org_df.to_string(index=False))
 
-    # (2) Lossless vs. Lossy breakdown
+    # (2) Lossless vs. Lossy breakdown (strictly paired BEFORE counting N_Tiles)
     gt_tables: list[pd.DataFrame] = []
     for gt_type, ggrp in joined.groupby("gt_type", sort=True):
-        n_t = int(ggrp["tile_id"].nunique())
-        curves = build_curves_from_df(ggrp, strict_pairing=True)
+        paired_ggrp = pair_codec_df(ggrp, strict_pairing=True)
+        if paired_ggrp.empty:
+            continue
+        n_t = int(paired_ggrp["tile_id"].nunique())
+        curves = build_curves_from_df(paired_ggrp, strict_pairing=False)
         tbl = score_curves_table(f"GT={gt_type} (n={n_t})", curves, anchor=anchor)
         if tbl is not None:
             tbl.insert(1, "gt_type", str(gt_type))
@@ -549,11 +564,12 @@ def evaluate_unified_benchmark(
         print("\n=== (2) Lossless vs. Lossy R-D (Akima) ===")
         print(gt_df.to_string(index=False))
 
-    # (1) Overall: Tile-Pooled + Stratum-Balanced Macro Mean
-    tile_meta = joined[["tile_id", "gt_type"]].drop_duplicates()
+    # (1) Overall: Tile-Pooled + Stratum-Balanced Macro Mean (strictly paired BEFORE counting)
+    paired_all = pair_codec_df(joined, strict_pairing=True)
+    tile_meta = paired_all[["tile_id", "gt_type"]].drop_duplicates()
     n_lossless = int((tile_meta["gt_type"] == "lossless").sum())
     n_lossy = int((tile_meta["gt_type"] == "lossy").sum())
-    overall_curves = build_curves_from_df(joined, strict_pairing=True)
+    overall_curves = build_curves_from_df(paired_all, strict_pairing=False)
     pooled_df = score_curves_table(
         f"Overall (Tile-Pooled, n_lossless={n_lossless}, n_lossy={n_lossy})",
         overall_curves,
@@ -564,7 +580,12 @@ def evaluate_unified_benchmark(
     if stratum_tables:
         org_all = pd.concat(stratum_tables, ignore_index=True)
         num_cols = [c for c in org_all.columns if c.startswith("BD-") or c in ("Min bpp", "Max bpp")]
-        macro = org_all.groupby("Codec / Model", as_index=False)[num_cols].mean()
+        n_strata = (
+            org_all.groupby("Codec / Model")["BD-Rate RGB-PSNR [%]"]
+            .apply(lambda s: int(s.notna().sum()))
+            .reset_index(name="N_Strata")
+        )
+        macro = org_all.groupby("Codec / Model", as_index=False)[num_cols].mean().merge(n_strata, on="Codec / Model")
         macro[num_cols] = macro[num_cols].round(2)
         macro.insert(0, "Cohort", f"Overall (Stratum-Balanced Macro Mean, {len(stratum_tables)} strata)")
         macro = macro.sort_values("BD-Rate RGB-PSNR [%]")
